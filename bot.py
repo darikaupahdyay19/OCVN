@@ -55,6 +55,30 @@ IS_WINDOWS = sys.platform == 'win32'
 TOOL_BINARY = TOOL_BINARY_NAME_WIN if IS_WINDOWS else TOOL_BINARY_NAME_LINUX
 TOOL_URL = TOOL_URL_WIN if IS_WINDOWS else TOOL_URL_LINUX
 
+def get_tool_path():
+    """Get the path to the N_m3u8DL-RE binary"""
+    if IS_WINDOWS:
+        # Check current directory
+        if os.path.exists(TOOL_BINARY_NAME_WIN):
+            return os.path.abspath(TOOL_BINARY_NAME_WIN)
+        # Check PATH
+        path = shutil.which("N_m3u8DL-RE")
+        if path:
+            return path
+        return TOOL_BINARY_NAME_WIN
+    else:
+        # Check /usr/local/bin
+        if os.path.exists("/usr/local/bin/N_m3u8DL-RE"):
+            return "/usr/local/bin/N_m3u8DL-RE"
+        # Check PATH
+        path = shutil.which("N_m3u8DL-RE")
+        if path:
+            return path
+        # Check local directory
+        if os.path.exists(TOOL_BINARY_NAME_LINUX):
+            return os.path.abspath(TOOL_BINARY_NAME_LINUX)
+        return TOOL_BINARY_NAME_LINUX
+
 # Apply nest_asyncio
 try:
     import nest_asyncio
@@ -160,17 +184,20 @@ def clean_filename(filename):
     # Clean up extra spaces
     filename = re.sub(r'\s+', ' ', filename).strip()
     
+    # Remove characters that might confuse parsers or look weird
+    filename = filename.replace('…', '').replace('～', '-')
+
     return filename
 
 def create_short_filename(series_name, episode_num, suffix):
-    """Create filename: 'Title ～ Subtitle… - ## [Type].mp4'"""
+    """Create filename: 'Title - Subtitle - ## [Type].mp4'"""
     series_name = clean_filename(series_name)
     
     # Keep the full name with subtitle, just truncate if too long
     max_series_len = 32
     
     if len(series_name) > max_series_len:
-        series_name = series_name[:max_series_len-1] + "…"
+        series_name = series_name[:max_series_len-1]
     
     # Remove [Dub] or [Sub] from series name if present to avoid duplication
     series_name = re.sub(r'\[Dub\]|\[Sub\]|\[Dual\]', '', series_name, flags=re.IGNORECASE).strip()
@@ -182,7 +209,7 @@ def create_short_filename(series_name, episode_num, suffix):
     
     if len(filename) > MAX_FILENAME_LENGTH:
         max_series_len = MAX_FILENAME_LENGTH - 20
-        series_name = series_name[:max_series_len] + "…"
+        series_name = series_name[:max_series_len]
         filename = f"{series_name} - {episode_num} {suffix}.mp4"
     
     return filename
@@ -354,8 +381,10 @@ class OCEANVEIL:
             return [], None, None, None, None
 
 async def setup_tool():
-    if os.path.exists(TOOL_BINARY): 
+    tool_path = get_tool_path()
+    if os.path.exists(tool_path):
         return
+
     logger.info(f"Downloading N_m3u8DL-RE tool ({TOOL_BINARY})...")
     async with aiohttp.ClientSession() as session:
         async with session.get(TOOL_URL) as resp:
@@ -396,7 +425,7 @@ async def download_file(semaphore, ep_data, auth, cookies, ua, save_dir, cancel_
         
         referer = f"https://oceanveil.net/anime_titles/{ep_data['anime_id']}?episode={ep_data['ep_id']}"
         cookies_str = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-        binary = os.path.abspath(TOOL_BINARY)
+        binary = get_tool_path()
         
         os.makedirs(save_dir, exist_ok=True)
         final_path = os.path.join(save_dir, f"{temp_filename}.mp4")
@@ -539,7 +568,8 @@ async def queue_cmd(client, message: Message):
     
     if user_id in active_tasks:
         task = active_tasks[user_id]
-        status_text += f"🔄 **Active:**\n{task.get('description', 'Processing...')}\n\n"
+        task_id = task.get('task_id', 'Unknown')
+        status_text += f"🔄 **Active (ID: `{task_id}`):**\n{task.get('description', 'Processing...')}\n\n"
     
     if user_id in task_queue and task_queue[user_id]:
         status_text += f"⏳ **Queued:** {len(task_queue[user_id])} tasks\n"
@@ -549,11 +579,27 @@ async def queue_cmd(client, message: Message):
 @app.on_message(filters.command(["cancel"]))
 async def cancel_cmd(client, message: Message):
     user_id = message.from_user.id
+    args = message.command
     
     if user_id not in active_tasks:
         await message.reply_text("❌ No active task to cancel.")
         return
     
+    # If a task ID is provided, check if it matches the active task
+    if len(args) > 1:
+        target_id = args[1]
+        task = active_tasks[user_id]
+        if task.get('task_id') == target_id:
+            if 'cancel_event' in task:
+                task['cancel_event'].set()
+                await message.reply_text(f"🛑 Cancelling task `{target_id}`...")
+            else:
+                await message.reply_text("❌ Cannot cancel this task.")
+        else:
+             await message.reply_text(f"❌ Task ID `{target_id}` not found in active tasks.")
+        return
+
+    # Default behavior: cancel active task
     task = active_tasks[user_id]
     if 'cancel_event' in task:
         task['cancel_event'].set()
@@ -567,7 +613,7 @@ async def dl_cmd(client, message: Message):
     args = message.command
     
     if len(args) < 2:
-        await message.reply_text("Usage: /dl <id> [ep or range]")
+        await message.reply_text("Usage: /dl <id> [-e ep/range]")
         return
     
     if user_id in active_tasks:
@@ -577,8 +623,20 @@ async def dl_cmd(client, message: Message):
     aid = args[1]
     ep_filter = None
     
-    if len(args) >= 3:
+    # Parse arguments
+    # Support both positional [ep] and -e [ep]
+    ep_arg = None
+    if "-e" in args:
+        try:
+            e_index = args.index("-e")
+            if e_index + 1 < len(args):
+                ep_arg = args[e_index + 1]
+        except ValueError:
+            pass
+    elif len(args) >= 3:
         ep_arg = args[2]
+
+    if ep_arg:
         if '-' in ep_arg:
             try:
                 start, end = map(int, ep_arg.split('-'))
@@ -636,7 +694,7 @@ async def dl_cmd(client, message: Message):
         'description': f"Downloading {series_clean}"
     }
 
-    await status.edit(f"✅ Found {len(episodes)} episodes\n⬇️ Starting...")
+    await status.edit(f"✅ Found {len(episodes)} episodes\n🆔 Task ID: `{unique_id}`\n⬇️ Starting...")
     
     progress = ProgressTracker(status, len(episodes), f"Downloading & Uploading {suffix}")
     
@@ -715,7 +773,7 @@ async def dual_cmd(client, message: Message):
     args = message.command
     
     if len(args) < 3:
-        await message.reply_text("Usage: /dual <id1> <id2> [ep or range]")
+        await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
         return
     
     if user_id in active_tasks:
@@ -731,9 +789,19 @@ async def dual_cmd(client, message: Message):
     id1, id2 = args[1], args[2]
     ep_filter = None
     
-    # Parse episode selection (3rd argument)
-    if len(args) >= 4:
+    # Parse episode selection
+    ep_arg = None
+    if "-e" in args:
+        try:
+            e_index = args.index("-e")
+            if e_index + 1 < len(args):
+                ep_arg = args[e_index + 1]
+        except ValueError:
+            pass
+    elif len(args) >= 4:
         ep_arg = args[3]
+
+    if ep_arg:
         if '-' in ep_arg:
             try:
                 start, end = map(int, ep_arg.split('-'))
