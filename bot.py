@@ -9,7 +9,6 @@ import logging
 import uuid
 import aiohttp
 import time
-import math
 import re
 import psutil
 from curl_cffi.requests import AsyncSession
@@ -319,6 +318,7 @@ class OCEANVEIL:
         self.session = None
         self.auth_header = None
         self.cookies = None
+        self.lock = asyncio.Lock()
 
     async def get_session(self):
         if self.session is None:
@@ -329,24 +329,27 @@ class OCEANVEIL:
         return self.session
 
     async def login(self):
-        session = await self.get_session()
-        logger.info(f"Logging in as {OV_EMAIL}...")
-        try:
-            res = await session.post(
-                "https://oceanveil.net/api/v1/users/login",
-                json={"user": {"email": OV_EMAIL, "password": OV_PASSWORD}}
-            )
-            if res.status_code not in (200, 201):
-                logger.error(f"Login failed: {res.status_code}")
+        async with self.lock:
+            if self.auth_header:
+                return True
+            session = await self.get_session()
+            logger.info(f"Logging in as {OV_EMAIL}...")
+            try:
+                res = await session.post(
+                    "https://oceanveil.net/api/v1/users/login",
+                    json={"user": {"email": OV_EMAIL, "password": OV_PASSWORD}}
+                )
+                if res.status_code not in (200, 201):
+                    logger.error(f"Login failed: {res.status_code}")
+                    return False
+
+                self.auth_header = res.headers.get('authorization')
+                self.cookies = res.cookies.get_dict()
+                logger.info("Login successful.")
+                return True
+            except Exception as e:
+                logger.error(f"Login error: {e}")
                 return False
-            
-            self.auth_header = res.headers.get('authorization')
-            self.cookies = res.cookies.get_dict()
-            logger.info("Login successful.")
-            return True
-        except Exception as e:
-            logger.error(f"Login error: {e}")
-            return False
 
     async def get_episodes(self, id):
         if not self.auth_header:
@@ -700,16 +703,11 @@ async def dl_cmd(client, message: Message):
         return
     
     series_clean = episodes[0]['series_name']
- enhance-bot-ui-and-concurrency-fixes
-    
     # Determine suffix based on command or detection
     if message.command[0].lower() == "engdl":
         suffix = "[Dub]"
     else:
         suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
-
-    suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
- main
     
     # Start Task
     unique_id = str(uuid.uuid4())[:8]
