@@ -700,12 +700,16 @@ async def dl_cmd(client, message: Message):
         return
     
     series_clean = episodes[0]['series_name']
+ enhance-bot-ui-and-concurrency-fixes
     
     # Determine suffix based on command or detection
     if message.command[0].lower() == "engdl":
         suffix = "[Dub]"
     else:
         suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
+
+    suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
+ main
     
     # Start Task
     unique_id = str(uuid.uuid4())[:8]
