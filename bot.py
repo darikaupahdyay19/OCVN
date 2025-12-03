@@ -172,8 +172,9 @@ def clean_filename(filename):
     for word in unwanted:
         filename = re.sub(re.escape(word), "", filename, flags=re.IGNORECASE)
     
-    # Remove tags like [Premium]
-    filename = re.sub(r'\[Premium\]', '', filename, flags=re.IGNORECASE)
+    # Remove tags like [Premium], [Dub], [Sub], [Dual]
+    # We do this before stripping to ensure we catch the full tag
+    filename = re.sub(r'\[(Premium|Dub|Sub|Dual)\]', '', filename, flags=re.IGNORECASE)
     
     # Remove empty brackets [] or ()
     filename = filename.replace("[]", "").replace("()", "")
@@ -199,8 +200,8 @@ def create_short_filename(series_name, episode_num, suffix):
     if len(series_name) > max_series_len:
         series_name = series_name[:max_series_len-1]
     
-    # Remove [Dub] or [Sub] from series name if present to avoid duplication
-    series_name = re.sub(r'\[Dub\]|\[Sub\]|\[Dual\]', '', series_name, flags=re.IGNORECASE).strip()
+    # Remove [Dub] or [Sub] from series name if present to avoid duplication (just in case clean_filename didn't catch it somehow)
+    series_name = re.sub(r'\[(Dub|Sub|Dual)\]', '', series_name, flags=re.IGNORECASE).strip()
     
     # Double check for empty brackets after removal
     series_name = series_name.replace("[]", "").strip()
