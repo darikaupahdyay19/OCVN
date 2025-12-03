@@ -5,3 +5,4 @@ curl_cffi
 nest_asyncio
 python-dotenv
 anitopy
+psutil
