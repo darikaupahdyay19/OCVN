@@ -1,0 +1,7 @@
+pyrogram
+TgCrypto
+aiohttp
+curl_cffi
+nest_asyncio
+python-dotenv
+anitopy
