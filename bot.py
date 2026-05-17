@@ -14,7 +14,12 @@ import re
 import psutil
 from curl_cffi.requests import AsyncSession
 from pyrogram import Client, filters, idle
-from pyrogram.types import Message
+from pyrogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
 from dotenv import load_dotenv
 
 # --- Configuration ---
@@ -244,29 +249,30 @@ def clean_filename(filename):
 
     return filename
 
-def create_short_filename(series_name, episode_num, suffix):
-    """Create filename: 'Title - Subtitle - ## [Type].mp4'"""
+def create_short_filename(series_name, episode_num, suffix, ext: str = "mp4"):
+    """Create filename: 'Title - Subtitle - ## [Type].<ext>'"""
     series_name = clean_filename(series_name)
-    
+
     # Keep the full name with subtitle, just truncate if too long
     max_series_len = 32
-    
+
     if len(series_name) > max_series_len:
         series_name = series_name[:max_series_len-1]
-    
+
     # Remove [Dub] or [Sub] from series name if present to avoid duplication (just in case clean_filename didn't catch it somehow)
     series_name = re.sub(r'\[(Dub|Sub|Dual)\]', '', series_name, flags=re.IGNORECASE).strip()
-    
+
     # Double check for empty brackets after removal
     series_name = series_name.replace("[]", "").strip()
-    
-    filename = f"{series_name} - {episode_num} {suffix}.mp4"
-    
+
+    ext = (ext or "mp4").lstrip(".").lower()
+    filename = f"{series_name} - {episode_num} {suffix}.{ext}"
+
     if len(filename) > MAX_FILENAME_LENGTH:
         max_series_len = MAX_FILENAME_LENGTH - 20
         series_name = series_name[:max_series_len]
-        filename = f"{series_name} - {episode_num} {suffix}.mp4"
-    
+        filename = f"{series_name} - {episode_num} {suffix}.{ext}"
+
     return filename
 
 def format_bytes(size):
@@ -693,6 +699,190 @@ class OCEANVEIL:
         )
         return results[:limit]
 
+
+# ---- Variant grouping & interactive flow helpers --------------------------
+
+# When a user starts an interactive download we stash the in-progress state
+# here keyed by a short token. Callback buttons reference that token.
+# Entries are dicts with whatever the next step needs (chat_id, owner_id,
+# title, candidate variants, message id, accumulated choices, etc).
+_pending_actions: dict = {}
+_PENDING_TTL_SEC = 30 * 60  # 30 minutes
+
+
+def _new_pending(payload: dict) -> str:
+    token = uuid.uuid4().hex[:10]
+    payload["created_at"] = time.time()
+    _pending_actions[token] = payload
+    # Cheap GC: drop expired entries.
+    cutoff = time.time() - _PENDING_TTL_SEC
+    for k in [k for k, v in _pending_actions.items() if v.get("created_at", 0) < cutoff]:
+        _pending_actions.pop(k, None)
+    return token
+
+
+def _norm_variant_name(name: str) -> str:
+    """Strip rating/audio tags from a title so siblings collapse to one key."""
+    s = name or ""
+    # Drop any [..] bracket group (handles [Dub], [18+], [Dub/18+], [Premium]...).
+    s = re.sub(r"\[.*?\]", "", s)
+    # Drop free-floating "Dub" / "18+" / "NSFW" markers.
+    s = re.sub(r"\b(?:dub|sub|18\+|nsfw)\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip(" -_:")
+    return s.lower()
+
+
+def _classify_variant(row: dict) -> tuple[str, str]:
+    """Return (rating, audio) for a search row.
+
+    rating: "nsfw" | "sfw"
+    audio:  "dub"  | "sub"
+    """
+    rating = "nsfw" if row.get("is_nsfw") else "sfw"
+    audio = "dub" if row.get("lang_code") == "eng" else "sub"
+    return rating, audio
+
+
+async def find_title_variants(query: str) -> tuple[str, dict]:
+    """Search OceanVeil and group hits for the best-matching base title.
+
+    Returns (display_name, variants) where variants is:
+      { "nsfw": {"sub": row_or_None, "dub": row_or_None},
+        "sfw":  {"sub": row_or_None, "dub": row_or_None} }
+    `display_name` is the cleaned base title we picked. Empty variants
+    means no matches at all.
+    """
+    rows = await ocean.search(query, limit=25)
+    empty = {"nsfw": {"sub": None, "dub": None}, "sfw": {"sub": None, "dub": None}}
+    if not rows:
+        return "", empty
+
+    # Bucket every row by its normalized base name.
+    groups: dict = {}
+    order: list = []
+    for r in rows:
+        key = _norm_variant_name(r["name"])
+        if not key:
+            continue
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(r)
+
+    if not groups:
+        return "", empty
+
+    ql = query.strip().lower()
+    norm_ql = _norm_variant_name(query)
+
+    # Pick the group that best matches the user's query: exact normalized
+    # match first, otherwise substring match, otherwise the first group
+    # the search returned (already ranked by relevance upstream).
+    chosen_key = None
+    if norm_ql and norm_ql in groups:
+        chosen_key = norm_ql
+    if chosen_key is None:
+        for k in order:
+            if ql and ql in k:
+                chosen_key = k
+                break
+    if chosen_key is None:
+        chosen_key = order[0]
+
+    variants = {"nsfw": {"sub": None, "dub": None}, "sfw": {"sub": None, "dub": None}}
+    for r in groups[chosen_key]:
+        rating, audio = _classify_variant(r)
+        # If two rows collide (same rating+audio bucket), keep the lower id.
+        cur = variants[rating][audio]
+        if cur is None or int(r["id"]) < int(cur["id"]):
+            variants[rating][audio] = r
+
+    # Display name = clean version of any row in the group.
+    sample = groups[chosen_key][0]
+    display = sample.get("name_clean") or clean_filename(sample.get("name", ""))
+    return display, variants
+
+
+def _ratings_available(variants: dict) -> list:
+    out = []
+    for rating in ("nsfw", "sfw"):
+        if any(variants.get(rating, {}).get(a) for a in ("sub", "dub")):
+            out.append(rating)
+    return out
+
+
+def _audios_available(variants: dict, rating: str) -> list:
+    """Returns ordered list of audio modes available for a rating.
+
+    "dual" is included if BOTH sub and dub variants exist for that rating.
+    """
+    bucket = variants.get(rating, {})
+    out = []
+    if bucket.get("sub"):
+        out.append("sub")
+    if bucket.get("dub"):
+        out.append("dub")
+    if bucket.get("sub") and bucket.get("dub"):
+        out.append("dual")
+    return out
+
+
+def _kb_rating(token: str, variants: dict, default_rating: str = "nsfw") -> InlineKeyboardMarkup:
+    available = _ratings_available(variants)
+    row = []
+    for r in ("nsfw", "sfw"):
+        if r not in available:
+            continue
+        label = "🔞 NSFW" if r == "nsfw" else "🟢 SFW"
+        if r == default_rating:
+            label = f"• {label} •"
+        row.append(InlineKeyboardButton(label, callback_data=f"v:rating:{token}:{r}"))
+    cancel = InlineKeyboardButton("✖ Cancel", callback_data=f"v:cancel:{token}")
+    return InlineKeyboardMarkup([row, [cancel]])
+
+
+def _kb_audio(token: str, variants: dict, rating: str) -> InlineKeyboardMarkup:
+    available = _audios_available(variants, rating)
+    labels = {"sub": "🇯🇵 Sub", "dub": "🇺🇸 Dub", "dual": "🎚 Dual"}
+    row = [
+        InlineKeyboardButton(labels[a], callback_data=f"v:audio:{token}:{a}")
+        for a in available
+    ]
+    rows = [row] if row else []
+    rows.append([
+        InlineKeyboardButton("⬅ Back", callback_data=f"v:back:{token}:rating"),
+        InlineKeyboardButton("✖ Cancel", callback_data=f"v:cancel:{token}"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def _kb_vsrc(token: str) -> InlineKeyboardMarkup:
+    """Pick which source carries the video stream in a Dual mux."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📺 Sub video", callback_data=f"v:vsrc:{token}:sub"),
+            InlineKeyboardButton("🎬 Dub video", callback_data=f"v:vsrc:{token}:dub"),
+        ],
+        [
+            InlineKeyboardButton("⬅ Back", callback_data=f"v:back:{token}:audio"),
+            InlineKeyboardButton("✖ Cancel", callback_data=f"v:cancel:{token}"),
+        ],
+    ])
+
+
+def _kb_container(token: str, can_back: bool = True, back_step: str = "audio") -> InlineKeyboardMarkup:
+    rows = [[
+        InlineKeyboardButton("MP4", callback_data=f"v:cont:{token}:mp4"),
+        InlineKeyboardButton("MKV", callback_data=f"v:cont:{token}:mkv"),
+    ]]
+    bottom = []
+    if can_back:
+        bottom.append(InlineKeyboardButton("⬅ Back", callback_data=f"v:back:{token}:{back_step}"))
+    bottom.append(InlineKeyboardButton("✖ Cancel", callback_data=f"v:cancel:{token}"))
+    rows.append(bottom)
+    return InlineKeyboardMarkup(rows)
+
+
 async def setup_tool():
     tool_path = get_tool_path()
     if os.path.exists(tool_path):
@@ -893,6 +1083,30 @@ def mux_dual_audio(audio_file, video_file, output_path, audio_lang, video_lang, 
         logger.error("[CRITICAL] FFmpeg not found.")
         return False
 
+def remux_to_mkv(src_path: str, dst_path: str) -> bool:
+    """Stream-copy src into a .mkv container (no re-encode).
+
+    Used after a single-source download when the user picked MKV. dst_path
+    is expected to already have a .mkv extension. Returns True on success.
+    """
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", src_path,
+                "-c", "copy", "-loglevel", "error",
+                dst_path,
+            ],
+            check=True,
+        )
+        return True
+    except FileNotFoundError:
+        logger.error("[CRITICAL] FFmpeg not found.")
+        return False
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[REMUX ERROR] {e}")
+        return False
+
+
 # --- Bot Logic ---
 
 # Session directory must be writable by the runtime user (see Dockerfile).
@@ -919,11 +1133,19 @@ async def start_cmd(client, message):
         "🌊 **OceanVeil Bot Ready!**\n\n"
         "🔎 **Find a title:**\n"
         "/search <name> - Search by name (returns ids; SFW + NSFW)\n\n"
-        "📥 **Download (id, URL, or name):**\n"
+        "📥 **Download (interactive prompts):**\n"
         "/dl <id|url|name> [-e ep|range]\n"
+        "    • id/URL → asks container (MP4/MKV)\n"
+        "    • name → asks rating (NSFW default), audio (Sub/Dub/Dual), and container\n"
+        "/sdl <name> [-e ep|range]\n"
+        "    • Same as /dl but auto-picks NSFW (falls back to SFW if no NSFW variant)\n"
         "/engdl <id|url|name> [-e ep|range]\n"
-        "/dual <id1|url1> <id2|url2> [-e ep|range] (Sub-video Dual)\n"
-        "/engvdiddual <id1|url1> <id2|url2> [-e ep|range] (Dub-video Dual)\n\n"
+        "    • Shortcut: forces Dub; only asks container\n"
+        "/dual <id1|url1> <id2|url2> [-e ep|range]\n"
+        "/dual <name> [-e ep|range]\n"
+        "    • Asks which source carries the video, then container\n"
+        "/engvdiddual <id1|url1> <id2|url2> [-e ep|range]\n"
+        "    • Shortcut: video=Dub source, asks container only\n\n"
         "⚙️ **Misc:**\n"
         "/queue - Show all tasks\n"
         "/cancel <id> - Cancel a task\n"
@@ -1168,6 +1390,347 @@ async def _resolve_anime_ref(token: str):
     return top["id"], top["name"]
 
 
+# ---- Shared download executors -------------------------------------------
+#
+# Both the slash-command handlers (when given a numeric id / URL) and the
+# inline-button callback router converge on these two helpers. They take
+# fully-resolved choices and own the entire download → mux → upload →
+# cleanup lifecycle.
+#
+# A note on ep_filter: tuple ('single', n) or ('range', a, b) or None.
+
+
+async def _execute_single_dl(
+    *,
+    chat_message,            # Pyrogram Message we reply to (downloads attach to it)
+    status_message,          # Pyrogram Message used as live status board
+    user_id: int,
+    user_name: str,
+    anime_id: str,
+    audio_choice: str,       # "sub" | "dub"  (drives the [Sub]/[Dub] suffix)
+    ext: str,                # "mp4" | "mkv"
+    ep_filter,
+):
+    """Run a single-source download (no muxing) for `anime_id`."""
+    await setup_tool()
+
+    episodes, auth, cookies, ua, lang_code = await ocean.get_episodes(anime_id)
+    if not episodes:
+        await status_message.edit("❌ Failed to fetch episodes.")
+        return
+
+    if ep_filter:
+        if ep_filter[0] == "single":
+            episodes = [ep for ep in episodes if int(ep["ep_num"]) == ep_filter[1]]
+        elif ep_filter[0] == "range":
+            start, end = ep_filter[1], ep_filter[2]
+            episodes = [ep for ep in episodes if start <= int(ep["ep_num"]) <= end]
+
+    if not episodes:
+        await status_message.edit("❌ No episodes found.")
+        return
+
+    series_clean = episodes[0]["series_name"]
+    # Suffix follows the user's audio choice. We trust the upstream
+    # resolution: callers pass audio="dub" only when the variant they
+    # picked is genuinely a dub.
+    suffix = "[Dub]" if audio_choice == "dub" else "[Sub]"
+
+    unique_id = str(uuid.uuid4())[:8]
+    temp_dir = os.path.join("temp_work", unique_id)
+    cancel_event = asyncio.Event()
+
+    active_tasks[unique_id] = {
+        "task_id": unique_id,
+        "user_id": user_id,
+        "user_name": user_name,
+        "cancel_event": cancel_event,
+        "status_msg": status_message,
+        "name": f"{series_clean} {suffix}",
+        "status": "Starting...",
+        "percentage": 0,
+        "processed_bytes": 0,
+        "total_bytes": 0,
+        "speed": 0,
+        "start_time": time.time(),
+        "eta": 0,
+    }
+
+    try:
+        await search_anilist(series_clean)
+
+        for idx, ep in enumerate(episodes, 1):
+            if cancel_event.is_set():
+                break
+
+            active_tasks[unique_id]["name"] = f"{series_clean} - Ep {ep['ep_num']}"
+            active_tasks[unique_id]["percentage"] = (idx / len(episodes)) * 100
+
+            temp_path = await download_file(
+                sem, ep, auth, cookies, ua, temp_dir, unique_id, cancel_event
+            )
+            if not temp_path or not os.path.exists(temp_path):
+                continue
+
+            # Always land in mp4 first, then remux to mkv if asked. The
+            # downloader writes mp4; remux is stream-copy so it's cheap.
+            mp4_name = create_short_filename(series_clean, ep["ep_num"], suffix, "mp4")
+            mp4_path = os.path.join(temp_dir, mp4_name)
+            if os.path.exists(mp4_path):
+                os.remove(mp4_path)
+            shutil.move(temp_path, mp4_path)
+
+            if ext == "mkv":
+                active_tasks[unique_id]["status"] = f"Remuxing Ep {ep['ep_num']}"
+                await progress_tracker.update_ui()
+                mkv_name = create_short_filename(series_clean, ep["ep_num"], suffix, "mkv")
+                mkv_path = os.path.join(temp_dir, mkv_name)
+                if remux_to_mkv(mp4_path, mkv_path):
+                    if os.path.exists(mp4_path):
+                        os.remove(mp4_path)
+                    final_path = mkv_path
+                else:
+                    # Remux failed — fall back to the mp4 we already have.
+                    final_path = mp4_path
+            else:
+                final_path = mp4_path
+
+            active_tasks[unique_id]["status"] = "Uploading"
+            await progress_tracker.update_ui()
+
+            try:
+                caption = (
+                    f"🎬 **{clean_filename(series_clean)}** - Episode {ep['ep_num']}\n"
+                    f"📝 {ep['ep_title']}\n"
+                    f"🎭 Type: {suffix}"
+                )
+
+                thumb_path = None
+                if (
+                    series_clean in anilist_cache
+                    and anilist_cache[series_clean].get("thumbnail")
+                ):
+                    thumb_path = await download_thumbnail(
+                        anilist_cache[series_clean]["thumbnail"],
+                        f"thumb_{unique_id}.jpg",
+                    )
+
+                async def progress_hook(current, total):
+                    if unique_id in active_tasks:
+                        active_tasks[unique_id]["status"] = "Uploading"
+                        active_tasks[unique_id]["processed_bytes"] = current
+                        active_tasks[unique_id]["total_bytes"] = total
+                        await progress_tracker.update_ui()
+
+                await chat_message.reply_document(
+                    document=final_path,
+                    thumb=thumb_path,
+                    caption=caption,
+                    progress=progress_hook,
+                )
+
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+
+            except Exception as e:
+                logger.error(f"Upload error: {e}")
+
+        if not cancel_event.is_set():
+            active_tasks[unique_id]["status"] = "Completed"
+            await progress_tracker.update_ui()
+            await asyncio.sleep(2)
+
+    finally:
+        if unique_id in active_tasks:
+            del active_tasks[unique_id]
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        await progress_tracker.update_ui()
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+
+async def _execute_dual_dl(
+    *,
+    chat_message,
+    status_message,
+    user_id: int,
+    user_name: str,
+    sub_id: str,
+    dub_id: str,
+    video_src: str,          # "sub" | "dub"  (which file carries the video stream)
+    ext: str,                # "mp4" | "mkv"
+    ep_filter,
+):
+    """Run a dual-audio download: pull both sources, mux them together."""
+    await setup_tool()
+
+    eps_sub, auth_sub, cookies_sub, ua_sub, lang_sub = await ocean.get_episodes(sub_id)
+    eps_dub, auth_dub, cookies_dub, ua_dub, lang_dub = await ocean.get_episodes(dub_id)
+    if not eps_sub or not eps_dub:
+        await status_message.edit("❌ Failed to fetch info.")
+        return
+
+    if video_src == "dub":
+        video_eps, audio_eps = eps_dub, eps_sub
+        video_auth, video_cookies, video_ua = auth_dub, cookies_dub, ua_dub
+        audio_auth, audio_cookies, audio_ua = auth_sub, cookies_sub, ua_sub
+        video_id, audio_id = dub_id, sub_id
+        video_has_primary = True
+    else:
+        video_eps, audio_eps = eps_sub, eps_dub
+        video_auth, video_cookies, video_ua = auth_sub, cookies_sub, ua_sub
+        audio_auth, audio_cookies, audio_ua = auth_dub, cookies_dub, ua_dub
+        video_id, audio_id = sub_id, dub_id
+        video_has_primary = False
+
+    if ep_filter:
+        if ep_filter[0] == "single":
+            n = ep_filter[1]
+            video_eps = [ep for ep in video_eps if int(ep["ep_num"]) == n]
+            audio_eps = [ep for ep in audio_eps if int(ep["ep_num"]) == n]
+        elif ep_filter[0] == "range":
+            a, b = ep_filter[1], ep_filter[2]
+            video_eps = [ep for ep in video_eps if a <= int(ep["ep_num"]) <= b]
+            audio_eps = [ep for ep in audio_eps if a <= int(ep["ep_num"]) <= b]
+
+    if not video_eps or not audio_eps:
+        await status_message.edit("❌ No episodes found matching filter.")
+        return
+
+    series_clean = video_eps[0]["series_name"]
+    unique_id = str(uuid.uuid4())[:8]
+    task_root = os.path.join("temp_work", unique_id)
+    audio_temp = os.path.join(task_root, "audio")
+    video_temp = os.path.join(task_root, "video")
+    cancel_event = asyncio.Event()
+
+    active_tasks[unique_id] = {
+        "task_id": unique_id,
+        "user_id": user_id,
+        "user_name": user_name,
+        "cancel_event": cancel_event,
+        "status_msg": status_message,
+        "name": f"{series_clean} [Dual]",
+        "status": "Starting...",
+        "percentage": 0,
+        "processed_bytes": 0,
+        "total_bytes": 0,
+        "speed": 0,
+        "start_time": time.time(),
+        "eta": 0,
+    }
+
+    try:
+        await search_anilist(series_clean)
+
+        active_tasks[unique_id]["status"] = "Downloading Sources"
+        await progress_tracker.update_ui()
+
+        tasks = []
+        for ep in audio_eps:
+            tasks.append(download_file(
+                sem, ep, audio_auth, audio_cookies, audio_ua,
+                audio_temp, unique_id, cancel_event,
+            ))
+        for ep in video_eps:
+            tasks.append(download_file(
+                sem, ep, video_auth, video_cookies, video_ua,
+                video_temp, unique_id, cancel_event,
+            ))
+        await asyncio.gather(*tasks)
+
+        if cancel_event.is_set():
+            return
+
+        active_tasks[unique_id]["status"] = "Muxing & Uploading"
+
+        audio_map = {}
+        for ep in audio_eps:
+            path = os.path.join(audio_temp, f"temp_{audio_id}_{ep['ep_num']}.mp4")
+            if os.path.exists(path):
+                audio_map[str(ep["ep_num"])] = path
+
+        for ep in video_eps:
+            if cancel_event.is_set():
+                break
+
+            ep_num = str(ep["ep_num"])
+            video_path = os.path.join(video_temp, f"temp_{video_id}_{ep_num}.mp4")
+            if not os.path.exists(video_path) or ep_num not in audio_map:
+                continue
+
+            final_filename = create_short_filename(series_clean, ep["ep_num"], "[Dual]", ext)
+            output_path = os.path.join(task_root, final_filename)
+
+            active_tasks[unique_id]["status"] = f"Muxing Ep {ep_num}"
+            await progress_tracker.update_ui()
+
+            a_lang = audio_eps[0]["lang_code"]
+            v_lang = video_eps[0]["lang_code"]
+
+            if not mux_dual_audio(
+                audio_map[ep_num], video_path, output_path,
+                a_lang, v_lang, video_has_primary,
+            ):
+                continue
+
+            active_tasks[unique_id]["status"] = f"Uploading Ep {ep_num}"
+            await progress_tracker.update_ui()
+
+            try:
+                caption = (
+                    f"🎬 **{clean_filename(series_clean)}** - Episode {ep_num}\n"
+                    f"📝 {ep['ep_title']}\n"
+                    f"🎭 Type: [Dual Audio]"
+                )
+
+                thumb_path = None
+                if (
+                    series_clean in anilist_cache
+                    and anilist_cache[series_clean].get("thumbnail")
+                ):
+                    thumb_path = await download_thumbnail(
+                        anilist_cache[series_clean]["thumbnail"],
+                        f"thumb_{unique_id}.jpg",
+                    )
+
+                async def progress_hook(current, total):
+                    if unique_id in active_tasks:
+                        active_tasks[unique_id]["status"] = "Uploading"
+                        active_tasks[unique_id]["processed_bytes"] = current
+                        active_tasks[unique_id]["total_bytes"] = total
+                        await progress_tracker.update_ui()
+
+                await chat_message.reply_document(
+                    document=output_path,
+                    thumb=thumb_path,
+                    caption=caption,
+                    progress=progress_hook,
+                )
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                if thumb_path and os.path.exists(thumb_path):
+                    os.remove(thumb_path)
+            except Exception as e:
+                logger.error(f"Dual upload error: {e}")
+
+    finally:
+        if unique_id in active_tasks:
+            del active_tasks[unique_id]
+        if os.path.exists(task_root):
+            shutil.rmtree(task_root, ignore_errors=True)
+        await progress_tracker.update_ui()
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+
+
 @app.on_message(filters.command(["search", "find"]))
 async def search_cmd(client, message: Message):
     """/search <query> -- list matching titles with their ids."""
@@ -1234,12 +1797,71 @@ async def _error_dm_drainer():
             await asyncio.sleep(2)
 
 
+def _parse_ep_arg(args, key="-e"):
+    """Pull '-e <ep|range>' out of a command's tokens.
+
+    Returns (ep_filter, error_msg, tokens_without_eparg).
+    ep_filter: None | ('single', n) | ('range', a, b)
+    """
+    if key not in args:
+        return None, None, args[1:]
+    try:
+        idx = args.index(key)
+    except ValueError:
+        return None, None, args[1:]
+    raw = args[idx + 1] if idx + 1 < len(args) else None
+    rest = args[1:idx]
+    if not raw:
+        return None, "❌ -e needs an episode number or range (e.g. 1-5).", rest
+    if "-" in raw:
+        try:
+            start, end = map(int, raw.split("-", 1))
+            return ("range", start, end), None, rest
+        except Exception:
+            return None, "❌ Invalid range. Use: 1-5", rest
+    try:
+        return ("single", int(raw)), None, rest
+    except Exception:
+        return None, "❌ Invalid episode number.", rest
+
+
+def _looks_like_ref(tok: str) -> bool:
+    return bool(tok and (tok.isdigit() or _OV_URL_ID_RE.search(tok)))
+
+
+def _summary_line(variants: dict, rating: str, audio: str = None) -> str:
+    """Pretty-print which sub-variant we're about to use."""
+    bucket = variants.get(rating, {})
+    if audio == "dual":
+        sub_id = (bucket.get("sub") or {}).get("id")
+        dub_id = (bucket.get("dub") or {}).get("id")
+        return f"Sub id `{sub_id}` + Dub id `{dub_id}` (Dual)"
+    if audio:
+        row = bucket.get(audio)
+        if row:
+            return f"`{row['id']}` — {row['name_clean']}"
+    # Just rating: list whatever sub-variants exist.
+    parts = []
+    for a in ("sub", "dub"):
+        if bucket.get(a):
+            parts.append(f"`{bucket[a]['id']}` ({a})")
+    return ", ".join(parts) or "(none)"
+
+
 @app.on_message(filters.command(["dl", "engdl"]))
 async def dl_cmd(client, message: Message):
+    """/dl <id|url|name> [-e <ep|range>].
+
+    - id / URL: skip rating + audio prompts (the variant is already picked)
+      and ask only for container.
+    - name: show rating prompt (NSFW default), then audio, then optionally
+      vsrc (for Dual), then container.
+    - /engdl: shortcut that forces audio=Dub. Still asks for container.
+    """
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     args = message.command
-    
+
     if len(args) < 2:
         await message.reply_text(
             "Usage:\n"
@@ -1252,412 +1874,594 @@ async def dl_cmd(client, message: Message):
         )
         return
 
-    # Split out an optional `-e <ep>` range first; everything before -e is
-    # treated as the title token (id, URL, or free-text name).
-    ep_arg = None
-    if "-e" in args:
-        try:
-            e_index = args.index("-e")
-        except ValueError:
-            e_index = len(args)
-        if e_index + 1 < len(args):
-            ep_arg = args[e_index + 1]
-        ref_tokens = args[1:e_index]
-    else:
-        ref_tokens = args[1:]
-
+    ep_filter, err, ref_tokens = _parse_ep_arg(args, "-e")
+    if err:
+        await message.reply_text(err)
+        return
     if not ref_tokens:
         await message.reply_text("Need an id, URL, or name. See /dl for usage.")
         return
 
-    # If the first token looks like an id or URL, use just that. Otherwise
-    # join the remaining tokens as a free-text title to search for.
+    is_engdl = args[0].lower() == "engdl"
+
+    # If the first token is an id/URL, skip the search/rating/audio prompts.
     first = ref_tokens[0]
-    if first.isdigit() or _OV_URL_ID_RE.search(first):
-        token = first
-    else:
-        token = " ".join(ref_tokens).strip()
-
-    ep_filter = None
-    if ep_arg:
-        if '-' in ep_arg:
-            try:
-                start, end = map(int, ep_arg.split('-'))
-                ep_filter = ('range', start, end)
-            except:
-                await message.reply_text("❌ Invalid range. Use: 1-5")
-                return
-        else:
-            try:
-                ep_num = int(ep_arg)
-                ep_filter = ('single', ep_num)
-            except:
-                await message.reply_text("❌ Invalid episode number.")
-                return
-
-    status = await message.reply_text(f"🔍 Resolving `{token}`...")
-
-    aid, resolved_name = await _resolve_anime_ref(token)
-    if not aid:
-        await status.edit(
-            f"❌ Couldn't resolve `{token}`. Try /search to find it."
+    if _looks_like_ref(first):
+        aid, _ = await _resolve_anime_ref(first)
+        if not aid:
+            await message.reply_text(f"❌ Couldn't resolve `{first}`.")
+            return
+        # Audio: derive from caller's choice (engdl forces Dub) or the
+        # title's metadata. We don't pre-fetch get_episodes here; the
+        # executor will handle it. Just guess from the title for the
+        # filename suffix and let the user override container.
+        token = _new_pending({
+            "kind": "single",
+            "owner_id": user_id,
+            "user_name": user_name,
+            "chat_id": message.chat.id,
+            "anime_id": aid,
+            "audio": "dub" if is_engdl else None,  # None => detect at run
+            "ep_filter": ep_filter,
+        })
+        kb = _kb_container(token, can_back=False)
+        await message.reply_text(
+            f"📦 Pick container for id `{aid}`:",
+            reply_markup=kb,
         )
         return
-    if resolved_name:
-        await status.edit(f"🔍 Found `{resolved_name}` (id `{aid}`). Fetching info...")
-    else:
-        await status.edit(f"🔍 Fetching info for `{aid}`...")
-    
-    # We do setup_tool here to ensure it's ready, but now it's locked.
-    await setup_tool()
 
-    episodes, auth, cookies, ua, lang_code = await ocean.get_episodes(aid)
-    if not episodes:
-        await status.edit("❌ Failed to fetch episodes.")
+    # Free-text name: search and group variants.
+    query = " ".join(ref_tokens).strip()
+    status = await message.reply_text(f"🔍 Searching `{query}`...")
+
+    display, variants = await find_title_variants(query)
+    if not display or not _ratings_available(variants):
+        await status.edit(
+            f"❌ No matches for `{query}`. Try /search to refine."
+        )
         return
-    
-    if ep_filter:
-        if ep_filter[0] == 'single':
-            episodes = [ep for ep in episodes if int(ep['ep_num']) == ep_filter[1]]
-        elif ep_filter[0] == 'range':
-            start, end = ep_filter[1], ep_filter[2]
-            episodes = [ep for ep in episodes if start <= int(ep['ep_num']) <= end]
-    
-    if not episodes:
-        await status.edit("❌ No episodes found.")
-        return
-    
-    series_clean = episodes[0]['series_name']
-    # Determine suffix based on command or detection
-    if message.command[0].lower() == "engdl":
-        suffix = "[Dub]"
-    else:
-        suffix = "[Dub]" if lang_code == "eng" else "[Sub]"
-    
-    # Start Task
-    unique_id = str(uuid.uuid4())[:8]
-    temp_dir = os.path.join("temp_work", unique_id)
-    cancel_event = asyncio.Event()
 
-    # Register Task
-    active_tasks[unique_id] = {
-        'task_id': unique_id,
-        'user_id': user_id,
-        'user_name': user_name,
-        'cancel_event': cancel_event,
-        'status_msg': status,
-        'name': f"{series_clean} {suffix}",
-        'status': "Starting...",
-        'percentage': 0,
-        'processed_bytes': 0,
-        'total_bytes': 0,
-        'speed': 0,
-        'start_time': time.time(),
-        'eta': 0
-    }
-    
-    try:
-        # Cache Anilist data
-        # search_anilist returns the data, we should verify it is cached
-        await search_anilist(series_clean)
-
-        for idx, ep in enumerate(episodes, 1):
-            if cancel_event.is_set():
+    # If /engdl was used, lock audio=dub up front. Pick the rating that
+    # actually has a Dub variant; prefer NSFW where possible.
+    if is_engdl:
+        ratings = _ratings_available(variants)
+        chosen_rating = None
+        for r in ("nsfw", "sfw"):
+            if r in ratings and variants[r].get("dub"):
+                chosen_rating = r
                 break
-            
-            # Update task info for global UI
-            active_tasks[unique_id]['name'] = f"{series_clean} - Ep {ep['ep_num']}"
-            active_tasks[unique_id]['percentage'] = (idx / len(episodes)) * 100
-            
-            temp_path = await download_file(sem, ep, auth, cookies, ua, temp_dir, unique_id, cancel_event)
-            if not temp_path or not os.path.exists(temp_path):
-                continue
-            
-            final_name = create_short_filename(series_clean, ep['ep_num'], suffix)
-            final_path = os.path.join(temp_dir, final_name)
+        if not chosen_rating:
+            await status.edit(
+                f"❌ No Dub variant found for `{display}`."
+            )
+            return
+        token = _new_pending({
+            "kind": "single",
+            "owner_id": user_id,
+            "user_name": user_name,
+            "chat_id": message.chat.id,
+            "display": display,
+            "variants": variants,
+            "rating": chosen_rating,
+            "audio": "dub",
+            "ep_filter": ep_filter,
+        })
+        await status.edit(
+            f"🎬 **{display}** — {chosen_rating.upper()} / Dub\n"
+            f"📦 Pick container:",
+            reply_markup=_kb_container(token, can_back=False),
+        )
+        return
 
-            if os.path.exists(final_path): os.remove(final_path)
-            shutil.move(temp_path, final_path)
-            
-            # Uploading
-            active_tasks[unique_id]['status'] = "Uploading"
-            await progress_tracker.update_ui()
+    # Normal /dl flow: rating prompt first, NSFW pre-highlighted.
+    token = _new_pending({
+        "kind": "single",
+        "owner_id": user_id,
+        "user_name": user_name,
+        "chat_id": message.chat.id,
+        "display": display,
+        "variants": variants,
+        "ep_filter": ep_filter,
+    })
 
-            try:
-                # Mock upload progress in global UI via progress callback if possible
-                # Pyrogram progress callback doesn't easily map back to our global loop unless we hook it.
-                # For now, simple upload message in global UI is "Uploading".
-                
-                caption = (
-                    f"🎬 **{clean_filename(series_clean)}** - Episode {ep['ep_num']}\n"
-                    f"📝 {ep['ep_title']}\n"
-                    f"🎭 Type: {suffix}"
+    available = _ratings_available(variants)
+    # If only one rating exists, skip straight to audio.
+    if len(available) == 1:
+        rating = available[0]
+        _pending_actions[token]["rating"] = rating
+        audios = _audios_available(variants, rating)
+        if len(audios) == 1:
+            # Only one audio mode too -- skip audio prompt.
+            _pending_actions[token]["audio"] = audios[0]
+            if audios[0] == "dual":
+                await status.edit(
+                    f"🎬 **{display}** — {rating.upper()} / Dual\n"
+                    f"🎞 Which source carries the video?",
+                    reply_markup=_kb_vsrc(token),
                 )
-                
-                # Fetch thumb from cache if available
-                thumb_path = None
-                if series_clean in anilist_cache and anilist_cache[series_clean].get('thumbnail'):
-                     thumb_path = await download_thumbnail(anilist_cache[series_clean]['thumbnail'], f"thumb_{unique_id}.jpg")
-
-                # Define a progress hook for upload
-                async def progress_hook(current, total):
-                    if unique_id in active_tasks:
-                        active_tasks[unique_id]['status'] = "Uploading"
-                        active_tasks[unique_id]['processed_bytes'] = current
-                        active_tasks[unique_id]['total_bytes'] = total
-                        # Speed calc omitted for simplicity but could be added
-                        await progress_tracker.update_ui()
-
-                await message.reply_document(
-                    document=final_path,
-                    thumb=thumb_path,
-                    caption=caption,
-                    progress=progress_hook
+            else:
+                await status.edit(
+                    f"🎬 **{display}** — {rating.upper()} / {audios[0].title()}\n"
+                    f"📦 Pick container:",
+                    reply_markup=_kb_container(token, can_back=False),
                 )
-                
-                if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                if os.path.exists(final_path): os.remove(final_path)
-                
-            except Exception as e:
-                logger.error(f"Upload error: {e}")
-        
-        if not cancel_event.is_set():
-            active_tasks[unique_id]['status'] = "Completed"
-            await progress_tracker.update_ui()
-            await asyncio.sleep(2) # Show completed state briefly
+            return
+        await status.edit(
+            f"🎬 **{display}** — {rating.upper()}\n"
+            f"🎙 Pick audio:",
+            reply_markup=_kb_audio(token, variants, rating),
+        )
+        return
 
-    finally:
-        if unique_id in active_tasks:
-            del active_tasks[unique_id]
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        # Final update to remove task from UI
-        await progress_tracker.update_ui()
-        try:
-            await status.delete()  # Remove status message when done
-        except Exception:
-            pass
+    await status.edit(
+        f"🎬 **{display}**\n"
+        f"🔞 Pick rating (NSFW default):",
+        reply_markup=_kb_rating(token, variants, default_rating="nsfw"),
+    )
 
-@app.on_message(filters.command(["dual", "engvdiddual"]))
-async def dual_cmd(client, message: Message):
-    # ... Implementation similar to dl_cmd but for dual audio ...
-    # Integrating Global UI and Registry
+
+@app.on_message(filters.command(["sdl"]))
+async def sdl_cmd(client, message: Message):
+    """/sdl <name> [-e <ep|range>] -- search-download with NSFW default.
+
+    Always picks NSFW silently; falls back to SFW only if the title has
+    no NSFW variant. After that the audio + container prompts are the
+    same as /dl. Names only — id / URL inputs go through /dl.
+    """
     user_id = message.from_user.id
     user_name = message.from_user.first_name
     args = message.command
-    
-    if len(args) < 3:
+
+    if len(args) < 2:
+        await message.reply_text(
+            "Usage: /sdl <name> [-e <ep|range>]\n"
+            "Auto-picks NSFW (falls back to SFW if no NSFW variant exists)."
+        )
+        return
+
+    ep_filter, err, ref_tokens = _parse_ep_arg(args, "-e")
+    if err:
+        await message.reply_text(err)
+        return
+    if not ref_tokens:
+        await message.reply_text("Usage: /sdl <name>")
+        return
+
+    query = " ".join(ref_tokens).strip()
+    status = await message.reply_text(f"🔍 Searching `{query}`...")
+
+    display, variants = await find_title_variants(query)
+    available = _ratings_available(variants)
+    if not display or not available:
+        await status.edit(
+            f"❌ No matches for `{query}`. Try /search to refine."
+        )
+        return
+
+    # NSFW preferred, SFW only as fallback.
+    rating = "nsfw" if "nsfw" in available else "sfw"
+    audios = _audios_available(variants, rating)
+    if not audios:
+        await status.edit(f"❌ No usable variant for `{display}`.")
+        return
+
+    token = _new_pending({
+        "kind": "single",
+        "owner_id": user_id,
+        "user_name": user_name,
+        "chat_id": message.chat.id,
+        "display": display,
+        "variants": variants,
+        "rating": rating,
+        "ep_filter": ep_filter,
+    })
+
+    # If only one audio is available, skip the audio prompt.
+    if len(audios) == 1:
+        _pending_actions[token]["audio"] = audios[0]
+        if audios[0] == "dual":
+            await status.edit(
+                f"🎬 **{display}** — {rating.upper()} / Dual\n"
+                f"🎞 Which source carries the video?",
+                reply_markup=_kb_vsrc(token),
+            )
+        else:
+            await status.edit(
+                f"🎬 **{display}** — {rating.upper()} / {audios[0].title()}\n"
+                f"📦 Pick container:",
+                reply_markup=_kb_container(token, can_back=False),
+            )
+        return
+
+    await status.edit(
+        f"🎬 **{display}** — {rating.upper()} (auto)\n"
+        f"🎙 Pick audio:",
+        reply_markup=_kb_audio(token, variants, rating),
+    )
+
+
+@app.on_message(filters.command(["dual", "engvdiddual"]))
+async def dual_cmd(client, message: Message):
+    """/dual <id1|url1> <id2|url2> [-e <ep|range>]   (two ids: pair them)
+       /dual <name>            [-e <ep|range>]       (one name: auto-pair)
+
+    For id/URL pairs we skip the variant prompts and only ask for
+    video-source + container. For a name we resolve a NSFW-preferred
+    pair via /search + variant grouping, then ask the same two questions.
+
+    /engvdiddual is a shortcut: id pair + force video_src=dub, ask
+    container only.
+    """
+    user_id = message.from_user.id
+    user_name = message.from_user.first_name
+    args = message.command
+
+    if len(args) < 2:
         await message.reply_text(
             "Usage:\n"
             "  /dual <id1|url1> <id2|url2> [-e <ep|range>]\n"
-            "  /engvdiddual <id1|url1> <id2|url2> [-e <ep|range>]\n"
-            "Names with spaces aren't supported here — run /search first to "
-            "get the ids, then pass two ids."
+            "  /dual <name> [-e <ep|range>]\n"
+            "  /engvdiddual <id1|url1> <id2|url2> [-e <ep|range>]"
         )
         return
 
-    await setup_tool()
-    
-    # ... (Argument Parsing same as dl_cmd) ...
-    # Simplified for this block:
-    raw1, raw2 = args[1], args[2]
-
-    # Reject free-text names here (no clean way to disambiguate two
-    # multi-word names on one command line). URLs and bare ids are fine.
-    if not (raw1.isdigit() or _OV_URL_ID_RE.search(raw1)):
-        await message.reply_text(
-            "First argument must be an id or oceanveil URL. "
-            "Use /search to look up ids by name."
-        )
+    ep_filter, err, rest = _parse_ep_arg(args, "-e")
+    if err:
+        await message.reply_text(err)
         return
-    if not (raw2.isdigit() or _OV_URL_ID_RE.search(raw2)):
-        await message.reply_text(
-            "Second argument must be an id or oceanveil URL. "
-            "Use /search to look up ids by name."
-        )
+    if not rest:
+        await message.reply_text("Need an id pair or name. See /dual for usage.")
         return
 
-    id1, _ = await _resolve_anime_ref(raw1)
-    id2, _ = await _resolve_anime_ref(raw2)
-    if not id1 or not id2:
-        await message.reply_text("Couldn't resolve one of the references.")
-        return
+    is_engvdid = args[0].lower() == "engvdiddual"
 
-    status = await message.reply_text("🔍 Fetching info...")
-    eps1, auth1, cookies1, ua1, lang1 = await ocean.get_episodes(id1)
-    eps2, auth2, cookies2, ua2, lang2 = await ocean.get_episodes(id2)
-    
-    if not eps1 or not eps2:
-        await status.edit("❌ Failed to fetch info.")
-        return
-
-    # ... (Language mapping logic same as before) ...
-    is_engvdiddual = message.command[0] == "engvdiddual"
-    
-    if lang1 == "eng" and lang2 != "eng":
-        dub_eps, sub_eps = eps1, eps2
-        dub_id, sub_id = id1, id2
-        dub_auth, dub_cookies, dub_ua = auth1, cookies1, ua1
-        sub_auth, sub_cookies, sub_ua = auth2, cookies2, ua2
-    elif lang2 == "eng" and lang1 != "eng":
-        dub_eps, sub_eps = eps2, eps1
-        dub_id, sub_id = id2, id1
-        dub_auth, dub_cookies, dub_ua = auth2, cookies2, ua2
-        sub_auth, sub_cookies, sub_ua = auth1, cookies1, ua1
-    else:
-        dub_eps, sub_eps = eps1, eps2
-        dub_id, sub_id = id1, id2
-        dub_auth, dub_cookies, dub_ua = auth1, cookies1, ua1
-        sub_auth, sub_cookies, sub_ua = auth2, cookies2, ua2
-
-    if is_engvdiddual:
-        video_eps, audio_eps = dub_eps, sub_eps
-        video_auth, video_cookies, video_ua = dub_auth, dub_cookies, dub_ua
-        audio_auth, audio_cookies, audio_ua = sub_auth, sub_cookies, sub_ua
-        video_has_primary = True
-        video_id, audio_id = dub_id, sub_id
-    else:
-        video_eps, audio_eps = sub_eps, dub_eps
-        video_auth, video_cookies, video_ua = sub_auth, sub_cookies, sub_ua
-        audio_auth, audio_cookies, audio_ua = dub_auth, dub_cookies, dub_ua
-        video_has_primary = False
-        video_id, audio_id = sub_id, dub_id
-
-    # Filter episodes
-    if "-e" in args:
-        try:
-            e_index = args.index("-e")
-            if e_index + 1 < len(args):
-                ep_arg = args[e_index + 1]
-                if '-' in ep_arg:
-                    start, end = map(int, ep_arg.split('-'))
-                    video_eps = [ep for ep in video_eps if start <= int(ep['ep_num']) <= end]
-                    audio_eps = [ep for ep in audio_eps if start <= int(ep['ep_num']) <= end]
-                else:
-                    ep_num = int(ep_arg)
-                    video_eps = [ep for ep in video_eps if int(ep['ep_num']) == ep_num]
-                    audio_eps = [ep for ep in audio_eps if int(ep['ep_num']) == ep_num]
-        except:
-            await message.reply_text("❌ Invalid episode filter")
+    # Two refs (id|URL pair).
+    if len(rest) >= 2 and _looks_like_ref(rest[0]) and _looks_like_ref(rest[1]):
+        id1, _ = await _resolve_anime_ref(rest[0])
+        id2, _ = await _resolve_anime_ref(rest[1])
+        if not id1 or not id2:
+            await message.reply_text("Couldn't resolve one of the references.")
             return
 
-    if not video_eps or not audio_eps:
-        await status.edit("❌ No episodes found matching filter.")
+        # We don't know which id is sub vs dub yet -- detect from API.
+        status = await message.reply_text("🔍 Inspecting both ids...")
+        eps1, _, _, _, lang1 = await ocean.get_episodes(id1)
+        eps2, _, _, _, lang2 = await ocean.get_episodes(id2)
+        if not eps1 or not eps2:
+            await status.edit("❌ Failed to fetch info for one of the ids.")
+            return
+
+        # Map to (sub_id, dub_id). If both look the same, treat first as
+        # sub and second as dub -- mux_dual_audio's safety net forces
+        # distinct language tags.
+        if lang1 == "eng" and lang2 != "eng":
+            sub_id, dub_id = id2, id1
+        elif lang2 == "eng" and lang1 != "eng":
+            sub_id, dub_id = id1, id2
+        else:
+            sub_id, dub_id = id1, id2
+
+        token = _new_pending({
+            "kind": "dual",
+            "owner_id": user_id,
+            "user_name": user_name,
+            "chat_id": message.chat.id,
+            "sub_id": sub_id,
+            "dub_id": dub_id,
+            "ep_filter": ep_filter,
+        })
+
+        if is_engvdid:
+            _pending_actions[token]["video_src"] = "dub"
+            await status.edit(
+                f"🎬 Dual: sub `{sub_id}` + dub `{dub_id}` (video=Dub)\n"
+                f"📦 Pick container:",
+                reply_markup=_kb_container(token, can_back=False),
+            )
+            return
+
+        await status.edit(
+            f"🎬 Dual: sub `{sub_id}` + dub `{dub_id}`\n"
+            f"🎞 Which source carries the video?",
+            reply_markup=_kb_vsrc(token),
+        )
         return
 
-    series_clean = video_eps[0]['series_name']
-    unique_id = str(uuid.uuid4())[:8]
-    task_root = os.path.join("temp_work", unique_id)
-    audio_temp = os.path.join(task_root, "audio")
-    video_temp = os.path.join(task_root, "video")
-    
-    cancel_event = asyncio.Event()
+    # Single free-text name -- auto-pair NSFW Sub+Dub via search.
+    if is_engvdid:
+        await message.reply_text(
+            "/engvdiddual takes two ids only. Use /dual <name> for auto-pair."
+        )
+        return
 
-    active_tasks[unique_id] = {
-        'task_id': unique_id,
-        'user_id': user_id,
-        'user_name': user_name,
-        'cancel_event': cancel_event,
-        'status_msg': status,
-        'name': f"{series_clean} [Dual]",
-        'status': "Starting...",
-        'percentage': 0,
-        'processed_bytes': 0,
-        'total_bytes': 0,
-        'speed': 0,
-        'start_time': time.time(),
-        'eta': 0
-    }
+    query = " ".join(rest).strip()
+    status = await message.reply_text(f"🔍 Searching `{query}`...")
+    display, variants = await find_title_variants(query)
+    available = _ratings_available(variants)
+    if not display or not available:
+        await status.edit(f"❌ No matches for `{query}`.")
+        return
 
+    # NSFW preferred; need both sub and dub in that bucket.
+    rating = None
+    for r in ("nsfw", "sfw"):
+        if r in available and variants[r].get("sub") and variants[r].get("dub"):
+            rating = r
+            break
+    if not rating:
+        await status.edit(
+            f"❌ `{display}` doesn't have both Sub and Dub variants for Dual."
+        )
+        return
+
+    sub_id = variants[rating]["sub"]["id"]
+    dub_id = variants[rating]["dub"]["id"]
+
+    token = _new_pending({
+        "kind": "dual",
+        "owner_id": user_id,
+        "user_name": user_name,
+        "chat_id": message.chat.id,
+        "display": display,
+        "rating": rating,
+        "sub_id": sub_id,
+        "dub_id": dub_id,
+        "ep_filter": ep_filter,
+    })
+
+    await status.edit(
+        f"🎬 **{display}** — {rating.upper()} / Dual\n"
+        f"sub `{sub_id}` + dub `{dub_id}`\n"
+        f"🎞 Which source carries the video?",
+        reply_markup=_kb_vsrc(token),
+    )
+
+
+# ---- Callback router for the inline keyboards ---------------------------
+
+
+@app.on_callback_query(filters.regex(r"^v:"))
+async def variant_cb(client, cq: CallbackQuery):
+    """Routes v:rating / v:audio / v:vsrc / v:cont / v:back / v:cancel."""
     try:
-        # Restore AniList search for Dual mode
-        await search_anilist(series_clean)
-        
-        active_tasks[unique_id]['status'] = "Downloading Sources"
-        await progress_tracker.update_ui()
+        parts = (cq.data or "").split(":")
+        if len(parts) < 3 or parts[0] != "v":
+            await cq.answer("Stale button.", show_alert=False)
+            return
+        action = parts[1]
+        token = parts[2]
+        value = parts[3] if len(parts) > 3 else None
 
-        # We need to pass unique_id to download_file to allow it to update status
-        tasks = []
-        for ep in audio_eps: 
-            tasks.append(download_file(sem, ep, audio_auth, audio_cookies, audio_ua, audio_temp, unique_id, cancel_event))
-        for ep in video_eps: 
-            tasks.append(download_file(sem, ep, video_auth, video_cookies, video_ua, video_temp, unique_id, cancel_event))
-        await asyncio.gather(*tasks)
-        
-        if cancel_event.is_set(): return
+        pending = _pending_actions.get(token)
+        if not pending:
+            await cq.answer("This menu expired. Run the command again.", show_alert=True)
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
 
-        # ... (Muxing and Uploading Logic) ...
-        # (Simplified for brevity, but includes status updates)
+        # Only the user who started the flow may click.
+        if cq.from_user.id != pending.get("owner_id"):
+            await cq.answer("This menu isn't for you.", show_alert=True)
+            return
 
-        active_tasks[unique_id]['status'] = "Muxing & Uploading"
-        
-        audio_map = {}
-        for ep in audio_eps:
-            path = os.path.join(audio_temp, f"temp_{audio_id}_{ep['ep_num']}.mp4")
-            if os.path.exists(path): audio_map[str(ep['ep_num'])] = path
+        kind = pending.get("kind")  # "single" | "dual"
+        variants = pending.get("variants")  # only for name-flows
 
-        for idx, ep in enumerate(video_eps, 1):
-            if cancel_event.is_set(): break
-            
-            ep_num = str(ep['ep_num'])
-            video_path = os.path.join(video_temp, f"temp_{video_id}_{ep_num}.mp4")
-            if not os.path.exists(video_path): continue
-            
-            if ep_num in audio_map:
-                final_filename = create_short_filename(series_clean, ep['ep_num'], "[Dual]")
-                output_path = os.path.join(task_root, final_filename)
-                
-                # Mux
-                active_tasks[unique_id]['status'] = f"Muxing Ep {ep_num}"
-                await progress_tracker.update_ui()
+        if action == "cancel":
+            _pending_actions.pop(token, None)
+            await cq.answer("Cancelled.")
+            try:
+                await cq.message.edit_text("✖ Cancelled.")
+            except Exception:
+                pass
+            return
 
-                a_lang = audio_eps[0]['lang_code']
-                v_lang = video_eps[0]['lang_code']
-                
-                if mux_dual_audio(audio_map[ep_num], video_path, output_path, a_lang, v_lang, video_has_primary):
-                    # Upload
-                    active_tasks[unique_id]['status'] = f"Uploading Ep {ep_num}"
-                    await progress_tracker.update_ui()
+        if action == "back":
+            target = value  # "rating" | "audio"
+            if kind == "single" and variants:
+                if target == "rating":
+                    pending.pop("rating", None)
+                    pending.pop("audio", None)
+                    await cq.message.edit_text(
+                        f"🎬 **{pending.get('display','?')}**\n"
+                        f"🔞 Pick rating (NSFW default):",
+                        reply_markup=_kb_rating(token, variants, "nsfw"),
+                    )
+                elif target == "audio":
+                    pending.pop("audio", None)
+                    rating = pending.get("rating", "nsfw")
+                    await cq.message.edit_text(
+                        f"🎬 **{pending.get('display','?')}** — {rating.upper()}\n"
+                        f"🎙 Pick audio:",
+                        reply_markup=_kb_audio(token, variants, rating),
+                    )
+            elif kind == "dual":
+                if target == "audio":
+                    # Dual flow only has vsrc -> container; "back" from
+                    # container returns to vsrc.
+                    pending.pop("video_src", None)
+                    sub_id = pending.get("sub_id")
+                    dub_id = pending.get("dub_id")
+                    await cq.message.edit_text(
+                        f"🎬 Dual: sub `{sub_id}` + dub `{dub_id}`\n"
+                        f"🎞 Which source carries the video?",
+                        reply_markup=_kb_vsrc(token),
+                    )
+            await cq.answer()
+            return
 
-                    try:
-                        caption = (
-                            f"🎬 **{clean_filename(series_clean)}** - Episode {ep_num}\n"
-                            f"📝 {ep['ep_title']}\n"
-                            f"🎭 Type: [Dual Audio]"
+        if action == "rating":
+            if kind != "single" or not variants:
+                await cq.answer("Not applicable.", show_alert=False)
+                return
+            pending["rating"] = value
+            audios = _audios_available(variants, value)
+            if len(audios) == 1:
+                pending["audio"] = audios[0]
+                if audios[0] == "dual":
+                    await cq.message.edit_text(
+                        f"🎬 **{pending.get('display','?')}** — {value.upper()} / Dual\n"
+                        f"🎞 Which source carries the video?",
+                        reply_markup=_kb_vsrc(token),
+                    )
+                else:
+                    await cq.message.edit_text(
+                        f"🎬 **{pending.get('display','?')}** — {value.upper()} / {audios[0].title()}\n"
+                        f"📦 Pick container:",
+                        reply_markup=_kb_container(token, can_back=True, back_step="rating"),
+                    )
+            else:
+                await cq.message.edit_text(
+                    f"🎬 **{pending.get('display','?')}** — {value.upper()}\n"
+                    f"🎙 Pick audio:",
+                    reply_markup=_kb_audio(token, variants, value),
+                )
+            await cq.answer()
+            return
+
+        if action == "audio":
+            if kind != "single" or not variants:
+                await cq.answer("Not applicable.", show_alert=False)
+                return
+            pending["audio"] = value
+            rating = pending.get("rating", "nsfw")
+            if value == "dual":
+                await cq.message.edit_text(
+                    f"🎬 **{pending.get('display','?')}** — {rating.upper()} / Dual\n"
+                    f"🎞 Which source carries the video?",
+                    reply_markup=_kb_vsrc(token),
+                )
+            else:
+                await cq.message.edit_text(
+                    f"🎬 **{pending.get('display','?')}** — {rating.upper()} / {value.title()}\n"
+                    f"📦 Pick container:",
+                    reply_markup=_kb_container(token, can_back=True, back_step="audio"),
+                )
+            await cq.answer()
+            return
+
+        if action == "vsrc":
+            pending["video_src"] = value
+            display = pending.get("display") or "Dual"
+            rating = pending.get("rating")
+            head = f"🎬 **{display}**"
+            if rating:
+                head += f" — {rating.upper()}"
+            head += f" / Dual (video={value.title()})"
+            await cq.message.edit_text(
+                head + "\n📦 Pick container:",
+                reply_markup=_kb_container(token, can_back=True, back_step="audio"),
+            )
+            await cq.answer()
+            return
+
+        if action == "cont":
+            ext = value if value in ("mp4", "mkv") else "mp4"
+            pending["ext"] = ext
+            # Hand off to the appropriate executor. We finalize the
+            # variant -> ids resolution here.
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            chat_id = pending.get("chat_id")
+            user_id = pending.get("owner_id")
+            user_name = pending.get("user_name") or "Unknown"
+            ep_filter = pending.get("ep_filter")
+
+            # Build a status message we can hand the executor (it will
+            # delete it when done). Reuse the menu message for that --
+            # avoids a second "Working..." message stacking up.
+            status_msg = cq.message
+
+            # Fetch a Message object we can call reply_document on.
+            # cq.message belongs to the bot, so its replies are top-level
+            # in the chat -- exactly what the previous handlers did.
+            chat_message = cq.message
+
+            _pending_actions.pop(token, None)
+            await cq.answer("Starting…")
+
+            if pending.get("kind") == "single":
+                if variants:
+                    rating = pending.get("rating", "nsfw")
+                    audio = pending.get("audio")
+                    if audio == "dual":
+                        sub_id = variants[rating]["sub"]["id"]
+                        dub_id = variants[rating]["dub"]["id"]
+                        await _execute_dual_dl(
+                            chat_message=chat_message,
+                            status_message=status_msg,
+                            user_id=user_id,
+                            user_name=user_name,
+                            sub_id=sub_id,
+                            dub_id=dub_id,
+                            video_src=pending.get("video_src", "sub"),
+                            ext=ext,
+                            ep_filter=ep_filter,
                         )
-                        
-                        thumb_path = None
-                        if series_clean in anilist_cache and anilist_cache[series_clean].get('thumbnail'):
-                             thumb_path = await download_thumbnail(anilist_cache[series_clean]['thumbnail'], f"thumb_{unique_id}.jpg")
+                        return
+                    row = variants[rating].get(audio)
+                    if not row:
+                        await status_msg.edit("❌ Variant unavailable.")
+                        return
+                    await _execute_single_dl(
+                        chat_message=chat_message,
+                        status_message=status_msg,
+                        user_id=user_id,
+                        user_name=user_name,
+                        anime_id=row["id"],
+                        audio_choice=audio,
+                        ext=ext,
+                        ep_filter=ep_filter,
+                    )
+                    return
 
-                        # Progress Hook for upload
-                        async def progress_hook(current, total):
-                            if unique_id in active_tasks:
-                                active_tasks[unique_id]['status'] = "Uploading"
-                                active_tasks[unique_id]['processed_bytes'] = current
-                                active_tasks[unique_id]['total_bytes'] = total
-                                await progress_tracker.update_ui()
+                # No variants info (id/URL path). Detect audio from API
+                # if caller didn't pin one (e.g. /engdl).
+                anime_id = pending.get("anime_id")
+                audio = pending.get("audio")
+                if not audio:
+                    _, _, _, _, lang_code = await ocean.get_episodes(anime_id)
+                    audio = "dub" if lang_code == "eng" else "sub"
+                await _execute_single_dl(
+                    chat_message=chat_message,
+                    status_message=status_msg,
+                    user_id=user_id,
+                    user_name=user_name,
+                    anime_id=anime_id,
+                    audio_choice=audio,
+                    ext=ext,
+                    ep_filter=ep_filter,
+                )
+                return
 
-                        await message.reply_document(
-                            document=output_path,
-                            thumb=thumb_path,
-                            caption=caption,
-                            progress=progress_hook
-                        )
-                        if os.path.exists(output_path): os.remove(output_path)
-                        if thumb_path and os.path.exists(thumb_path): os.remove(thumb_path)
-                    except: pass
+            if pending.get("kind") == "dual":
+                await _execute_dual_dl(
+                    chat_message=chat_message,
+                    status_message=status_msg,
+                    user_id=user_id,
+                    user_name=user_name,
+                    sub_id=pending["sub_id"],
+                    dub_id=pending["dub_id"],
+                    video_src=pending.get("video_src", "sub"),
+                    ext=ext,
+                    ep_filter=ep_filter,
+                )
+                return
 
-    finally:
-        if unique_id in active_tasks:
-            del active_tasks[unique_id]
-        if os.path.exists(task_root):
-            shutil.rmtree(task_root, ignore_errors=True)
-        await progress_tracker.update_ui()
+        await cq.answer()
+    except Exception as e:
+        logger.error(f"variant_cb error: {e}")
         try:
-            await status.delete()
+            await cq.answer("Something went wrong; check logs.", show_alert=True)
         except Exception:
             pass
+
 
 if __name__ == "__main__":
     async def main():
