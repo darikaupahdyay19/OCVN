@@ -515,14 +515,20 @@ class OCEANVEIL:
             json_resp = res.json()
             attributes = json_resp['data'].get("attributes", {})
             series_name = attributes.get("name", "Unknown")
-            
-            # Robust Language Detection
-            series_name_clean = clean_filename(series_name)
-            is_dub = False
 
-            if "dub" in series_name_clean.lower():
-                is_dub = True
-            
+            # Robust Language Detection
+            # NOTE: clean_filename() strips [Dub]/[Sub]/[Premium] tags, so we
+            # MUST detect language from the RAW title (before cleaning).
+            # Otherwise a title like "[Dub][Premium] Foo (Japanese)" gets
+            # cleaned to "Foo (Japanese)" and dub detection silently fails,
+            # causing dual-audio mux to label both tracks as Japanese.
+            series_name_clean = clean_filename(series_name)
+            raw_lower = (series_name or "").lower()
+            is_dub = bool(
+                re.search(r"\[\s*dub", raw_lower)  # explicit [Dub] tag
+                or re.search(r"\bdub\b", raw_lower)  # standalone "dub" word
+            )
+
             lang_code = "eng" if is_dub else "jpn"
             lang_name = "English" if is_dub else "Japanese"
             
@@ -688,6 +694,20 @@ async def download_file(semaphore, ep_data, auth, cookies, ua, save_dir, task_id
 def mux_dual_audio(audio_file, video_file, output_path, audio_lang, video_lang, video_has_primary_audio=False):
     """Muxes Audio from File 1 + Video from File 2"""
     logger.info(f"   -> Muxing: {os.path.basename(output_path)}")
+
+    # Safety net: dual-audio output must NEVER have two tracks with the same
+    # language label. If detection upstream returned the same lang for both
+    # sources, force the secondary track to the opposite language so the
+    # final file still has distinguishable [eng] / [jpn] streams.
+    if audio_lang == video_lang:
+        logger.warning(
+            f"[MUX] Both sources reported lang={audio_lang}; "
+            f"forcing secondary track to opposite language."
+        )
+        if video_lang == "eng":
+            audio_lang = "jpn"
+        else:
+            audio_lang = "eng"
 
     if video_has_primary_audio:
         lang1_code = "eng" if video_lang == "eng" else "jpn"
