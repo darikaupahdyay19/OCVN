@@ -517,17 +517,31 @@ class OCEANVEIL:
             series_name = attributes.get("name", "Unknown")
 
             # Robust Language Detection
-            # NOTE: clean_filename() strips [Dub]/[Sub]/[Premium] tags, so we
-            # MUST detect language from the RAW title (before cleaning).
-            # Otherwise a title like "[Dub][Premium] Foo (Japanese)" gets
-            # cleaned to "Foo (Japanese)" and dub detection silently fails,
-            # causing dual-audio mux to label both tracks as Japanese.
+            # Strategy:
+            #   1. Trust the API if it tells us the audio language directly
+            #      (some titles expose `audioLanguage` / `language`).
+            #   2. Otherwise look at the RAW title for an explicit [Dub] tag
+            #      or a standalone "dub" word. We must do this BEFORE
+            #      clean_filename() runs, because that helper strips
+            #      [Dub]/[Sub]/[Premium] tags and would erase our signal.
             series_name_clean = clean_filename(series_name)
-            raw_lower = (series_name or "").lower()
-            is_dub = bool(
-                re.search(r"\[\s*dub", raw_lower)  # explicit [Dub] tag
-                or re.search(r"\bdub\b", raw_lower)  # standalone "dub" word
+            api_audio = (
+                attributes.get("audioLanguage")
+                or attributes.get("language")
+                or ""
             )
+            api_audio_lower = str(api_audio).lower()
+            raw_lower = (series_name or "").lower()
+
+            if any(x in api_audio_lower for x in ("en", "eng", "english", "dub")):
+                is_dub = True
+            elif any(x in api_audio_lower for x in ("ja", "jp", "jpn", "japanese", "sub")):
+                is_dub = False
+            else:
+                is_dub = bool(
+                    re.search(r"\[\s*dub", raw_lower)   # explicit [Dub] tag
+                    or re.search(r"\bdub\b", raw_lower) # standalone "dub" word
+                )
 
             lang_code = "eng" if is_dub else "jpn"
             lang_name = "English" if is_dub else "Japanese"
@@ -559,6 +573,83 @@ class OCEANVEIL:
         except Exception as e:
             logger.error(f"Error fetching ID {id}: {e}")
             return [], None, None, None, None
+
+    async def search(self, query, limit: int = 15):
+        """Search OceanVeil anime titles by name.
+
+        Returns a list of dicts: [{id, name, lang_code, lang_name, is_nsfw}, ...]
+        Tries the typical JSON:API filter shapes; falls back gracefully if
+        one shape isn't supported by the backend. Authenticated users see
+        both SFW and NSFW results — we expose whichever the server returns.
+        """
+        if not self.auth_header:
+            if not await self.login():
+                return []
+
+        session = await self.get_session()
+        req_headers = {}
+        if self.auth_header:
+            req_headers["authorization"] = self.auth_header
+
+        from urllib.parse import quote_plus
+        q = quote_plus(query.strip())
+        # Try the common JSON:API filter shapes used by ember/spree-style
+        # backends. The first one that yields non-empty data wins.
+        url_candidates = [
+            f"https://oceanveil.net/api/v1/anime_titles?filter%5Bname%5D={q}&page%5Blimit%5D={limit}",
+            f"https://oceanveil.net/api/v1/anime_titles?filter%5Btext%5D={q}&page%5Blimit%5D={limit}",
+            f"https://oceanveil.net/api/v1/anime_titles?q={q}&page%5Blimit%5D={limit}",
+        ]
+
+        for url in url_candidates:
+            try:
+                res = await session.get(url, headers=req_headers, cookies=self.cookies)
+            except Exception as e:
+                logger.debug(f"search GET failed for {url}: {e}")
+                continue
+            if res.status_code != 200:
+                logger.debug(f"search non-200 ({res.status_code}) for {url}")
+                continue
+            try:
+                payload = res.json()
+            except Exception:
+                continue
+            items = payload.get("data") or []
+            if not items:
+                continue
+
+            results = []
+            ql = query.strip().lower()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                attrs = item.get("attributes") or {}
+                name = attrs.get("name") or ""
+                # Trim to top `limit` AFTER ranking by simple substring match
+                # so the most relevant rows show first.
+                results.append({
+                    "id": str(item.get("id", "")),
+                    "name": name,
+                    "name_clean": clean_filename(name),
+                    "raw_name": name,
+                    "lang_code": "eng" if (
+                        re.search(r"\[\s*dub", name.lower())
+                        or re.search(r"\bdub\b", name.lower())
+                    ) else "jpn",
+                    "is_nsfw": bool(
+                        attrs.get("nsfw")
+                        or attrs.get("isNsfw")
+                        or attrs.get("isAdult")
+                        or attrs.get("ageRating") in ("R18", "NSFW", "Adult")
+                    ),
+                })
+            results.sort(
+                key=lambda r: (0 if ql in r["name"].lower() else 1, r["name"].lower())
+            )
+            results = results[:limit]
+            if results:
+                return results
+        return []
 
 async def setup_tool():
     tool_path = get_tool_path()
@@ -784,17 +875,20 @@ progress_tracker = GlobalProgressTracker()
 async def start_cmd(client, message):
     await message.reply_text(
         "🌊 **OceanVeil Bot Ready!**\n\n"
-        "📥 **Commands:**\n"
-        "/dl <id> [ep] - Download episodes\n"
-        "/engdl <id> [ep] - Download English dub\n"
-        "/dual <id1> <id2> [ep] - Dual Audio (Sub Video)\n"
-        "/engvdiddual <id1> <id2> [ep] - Dual Audio (Dub Video)\n"
+        "🔎 **Find a title:**\n"
+        "/search <name> - Search by name (returns ids; SFW + NSFW)\n\n"
+        "📥 **Download (id, URL, or name):**\n"
+        "/dl <id|url|name> [-e ep|range]\n"
+        "/engdl <id|url|name> [-e ep|range]\n"
+        "/dual <id1|url1> <id2|url2> [-e ep|range] (Sub-video Dual)\n"
+        "/engvdiddual <id1|url1> <id2|url2> [-e ep|range] (Dub-video Dual)\n\n"
+        "⚙️ **Misc:**\n"
         "/queue - Show all tasks\n"
         "/cancel <id> - Cancel a task\n"
         "/logs [N] - Show last N log lines (owner only)\n"
-        "/setcookies - Load cookies.txt as OceanVeil session (owner only, DM)\n"
-        "/clearcookies - Drop cookie override (owner only, DM)\n"
-        "/cookiesinfo - Show active cookie override (owner only, DM)"
+        "/setcookies - Load cookies.txt as OceanVeil session (owner, DM)\n"
+        "/clearcookies - Drop cookie override (owner, DM)\n"
+        "/cookiesinfo - Show active cookie override (owner, DM)"
     )
 
 @app.on_message(filters.command(["queue", "status"]))
@@ -994,6 +1088,83 @@ async def cookiesinfo_cmd(client, message: Message):
     )
 
 
+_OV_URL_ID_RE = re.compile(
+    r"oceanveil\.net/(?:anime_titles|api/v1/anime_titles)/(\d+)",
+    re.IGNORECASE,
+)
+
+
+async def _resolve_anime_ref(token: str):
+    """Turn a user-supplied token into an OceanVeil anime id.
+
+    Accepts:
+      - bare numeric id, e.g. "274"
+      - oceanveil.net URL, e.g.
+        "https://oceanveil.net/anime_titles/274?..."
+      - free-text name; we run /search and use the top hit.
+
+    Returns (id_str, display_name) or (None, None) if nothing matched.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None, None
+
+    # 1) Bare numeric id.
+    if token.isdigit():
+        return token, None
+
+    # 2) URL with /anime_titles/<id>.
+    m = _OV_URL_ID_RE.search(token)
+    if m:
+        return m.group(1), None
+
+    # 3) Otherwise treat it as a free-text name.
+    results = await ocean.search(token, limit=5)
+    if not results:
+        return None, None
+    top = results[0]
+    return top["id"], top["name"]
+
+
+@app.on_message(filters.command(["search", "find"]))
+async def search_cmd(client, message: Message):
+    """/search <query> -- list matching titles with their ids."""
+    args = message.command
+    if len(args) < 2:
+        await message.reply_text("Usage: /search <name>")
+        return
+    query = " ".join(args[1:]).strip()
+    if not query:
+        await message.reply_text("Usage: /search <name>")
+        return
+
+    status = await message.reply_text(f"🔍 Searching for `{query}`...")
+    try:
+        results = await ocean.search(query, limit=15)
+    except Exception as e:
+        logger.error(f"search error: {e}")
+        await status.edit("Search failed (see logs).")
+        return
+
+    if not results:
+        await status.edit(f"No results for `{query}`.")
+        return
+
+    lines = [f"🔎 **Results for** `{query}`:\n"]
+    for r in results:
+        flags = []
+        if r["lang_code"] == "eng":
+            flags.append("Dub")
+        if r["is_nsfw"]:
+            flags.append("18+")
+        tag = f" [{'/'.join(flags)}]" if flags else ""
+        lines.append(f"`{r['id']}` — {r['name_clean']}{tag}")
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…(truncated)"
+    await status.edit(text)
+
+
 async def _error_dm_drainer():
     """Background task: forward queued ERROR logs to OWNER_ID."""
     if OWNER_ID is None:
@@ -1028,24 +1199,44 @@ async def dl_cmd(client, message: Message):
     args = message.command
     
     if len(args) < 2:
-        await message.reply_text("Usage: /dl <id> [-e ep/range]")
+        await message.reply_text(
+            "Usage:\n"
+            "  /dl <id|url|name> [-e <ep|range>]\n"
+            "  /engdl <id|url|name> [-e <ep|range>]\n"
+            "Examples:\n"
+            "  /dl 274\n"
+            "  /dl https://oceanveil.net/anime_titles/274\n"
+            "  /dl Guilty Hole -e 1-3"
+        )
         return
-    
-    aid = args[1]
-    ep_filter = None
-    
-    # Parse arguments
+
+    # Split out an optional `-e <ep>` range first; everything before -e is
+    # treated as the title token (id, URL, or free-text name).
     ep_arg = None
     if "-e" in args:
         try:
             e_index = args.index("-e")
-            if e_index + 1 < len(args):
-                ep_arg = args[e_index + 1]
         except ValueError:
-            pass
-    elif len(args) >= 3:
-        ep_arg = args[2]
+            e_index = len(args)
+        if e_index + 1 < len(args):
+            ep_arg = args[e_index + 1]
+        ref_tokens = args[1:e_index]
+    else:
+        ref_tokens = args[1:]
 
+    if not ref_tokens:
+        await message.reply_text("Need an id, URL, or name. See /dl for usage.")
+        return
+
+    # If the first token looks like an id or URL, use just that. Otherwise
+    # join the remaining tokens as a free-text title to search for.
+    first = ref_tokens[0]
+    if first.isdigit() or _OV_URL_ID_RE.search(first):
+        token = first
+    else:
+        token = " ".join(ref_tokens).strip()
+
+    ep_filter = None
     if ep_arg:
         if '-' in ep_arg:
             try:
@@ -1061,8 +1252,19 @@ async def dl_cmd(client, message: Message):
             except:
                 await message.reply_text("❌ Invalid episode number.")
                 return
-    
-    status = await message.reply_text(f"🔍 Fetching info for {aid}...")
+
+    status = await message.reply_text(f"🔍 Resolving `{token}`...")
+
+    aid, resolved_name = await _resolve_anime_ref(token)
+    if not aid:
+        await status.edit(
+            f"❌ Couldn't resolve `{token}`. Try /search to find it."
+        )
+        return
+    if resolved_name:
+        await status.edit(f"🔍 Found `{resolved_name}` (id `{aid}`). Fetching info...")
+    else:
+        await status.edit(f"🔍 Fetching info for `{aid}`...")
     
     # We do setup_tool here to ensure it's ready, but now it's locked.
     await setup_tool()
@@ -1203,15 +1405,42 @@ async def dual_cmd(client, message: Message):
     args = message.command
     
     if len(args) < 3:
-        await message.reply_text("Usage: /dual <id1> <id2> [-e ep/range]")
+        await message.reply_text(
+            "Usage:\n"
+            "  /dual <id1|url1> <id2|url2> [-e <ep|range>]\n"
+            "  /engvdiddual <id1|url1> <id2|url2> [-e <ep|range>]\n"
+            "Names with spaces aren't supported here — run /search first to "
+            "get the ids, then pass two ids."
+        )
         return
 
     await setup_tool()
     
     # ... (Argument Parsing same as dl_cmd) ...
     # Simplified for this block:
-    id1, id2 = args[1], args[2]
-    
+    raw1, raw2 = args[1], args[2]
+
+    # Reject free-text names here (no clean way to disambiguate two
+    # multi-word names on one command line). URLs and bare ids are fine.
+    if not (raw1.isdigit() or _OV_URL_ID_RE.search(raw1)):
+        await message.reply_text(
+            "First argument must be an id or oceanveil URL. "
+            "Use /search to look up ids by name."
+        )
+        return
+    if not (raw2.isdigit() or _OV_URL_ID_RE.search(raw2)):
+        await message.reply_text(
+            "Second argument must be an id or oceanveil URL. "
+            "Use /search to look up ids by name."
+        )
+        return
+
+    id1, _ = await _resolve_anime_ref(raw1)
+    id2, _ = await _resolve_anime_ref(raw2)
+    if not id1 or not id2:
+        await message.reply_text("Couldn't resolve one of the references.")
+        return
+
     status = await message.reply_text("🔍 Fetching info...")
     eps1, auth1, cookies1, ua1, lang1 = await ocean.get_episodes(id1)
     eps2, auth2, cookies2, ua2, lang2 = await ocean.get_episodes(id2)
