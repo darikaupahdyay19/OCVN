@@ -4,7 +4,11 @@ FROM python:3.10-slim
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# System dependencies
+# System dependencies.
+# libicu + libssl + libstdc++/zlib are required by the .NET runtime that
+# ships inside N_m3u8DL-RE; without them the binary aborts (SIGABRT) before
+# it even parses arguments, with a stack trace pointing at
+# System.Text.EncodingHelper.GetCharset / Console.get_OutputEncoding.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
@@ -13,6 +17,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     unzip \
     ca-certificates \
+    libicu-dev \
+    libssl-dev \
+    libstdc++6 \
+    zlib1g \
+    locales \
  && rm -rf /var/lib/apt/lists/*
 
 # Install N_m3u8DL-RE (linux x64 build)
@@ -44,6 +53,13 @@ USER appuser
 
 # Tell the bot where to keep the Pyrogram session file
 ENV SESSION_DIR=/app/sessions
+
+# Belt-and-suspenders: tell .NET (used by N_m3u8DL-RE) to skip ICU entirely
+# in case the runtime still struggles to detect the console encoding inside
+# the slim image. Combined with libicu-dev above this should be airtight.
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1 \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8
 
 # Start your bot
 CMD ["python", "bot.py"]
