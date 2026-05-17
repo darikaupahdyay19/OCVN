@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import sys
@@ -369,6 +370,90 @@ class OCEANVEIL:
         self.auth_header = None
         self.cookies = None
         self.lock = asyncio.Lock()
+        # Cookie override: when set (via /setcookies), skip email/password
+        # login and use these cookies directly for OceanVeil API + downloader.
+        self.cookie_override = None  # dict[str, str] or None
+        self.auth_header_override = None  # str or None (e.g. "Bearer ...")
+        self._load_cookie_override()
+
+    # --- Cookie override helpers ---
+
+    def _cookie_store_path(self):
+        return os.path.join(SESSION_DIR, "ov_cookies.json")
+
+    def _load_cookie_override(self):
+        path = self._cookie_store_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cookies = data.get("cookies") or {}
+            if isinstance(cookies, dict) and cookies:
+                self.cookie_override = cookies
+                self.cookies = dict(cookies)
+                auth = data.get("auth_header")
+                if auth:
+                    self.auth_header_override = auth
+                    self.auth_header = auth
+                logger.info(
+                    f"Loaded cookie override from {path} "
+                    f"({len(cookies)} cookies, auth={'yes' if auth else 'no'})."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to load cookie override: {e}")
+
+    def _save_cookie_override(self):
+        path = self._cookie_store_path()
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "cookies": self.cookie_override or {},
+                        "auth_header": self.auth_header_override,
+                    },
+                    f,
+                )
+        except Exception as e:
+            logger.warning(f"Failed to save cookie override: {e}")
+
+    async def set_cookie_override(self, cookies: dict, auth_header: str = None):
+        """Replace the active OceanVeil session with user-supplied cookies."""
+        async with self.lock:
+            self.cookie_override = dict(cookies)
+            self.cookies = dict(cookies)
+            self.auth_header_override = auth_header
+            # Force using the override for any subsequent API calls.
+            self.auth_header = auth_header
+            # Drop the existing curl_cffi session so new cookies/headers apply.
+            try:
+                if self.session is not None:
+                    await self.session.close()
+            except Exception:
+                pass
+            self.session = None
+            self._save_cookie_override()
+
+    async def clear_cookie_override(self):
+        """Remove cookie override and fall back to email/password login."""
+        async with self.lock:
+            self.cookie_override = None
+            self.auth_header_override = None
+            self.auth_header = None
+            self.cookies = None
+            try:
+                if self.session is not None:
+                    await self.session.close()
+            except Exception:
+                pass
+            self.session = None
+            path = self._cookie_store_path()
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     async def get_session(self):
         if self.session is None:
@@ -380,6 +465,11 @@ class OCEANVEIL:
 
     async def login(self):
         async with self.lock:
+            # If a cookie override is active, treat ourselves as already logged in.
+            if self.cookie_override:
+                self.cookies = dict(self.cookie_override)
+                self.auth_header = self.auth_header_override
+                return True
             if self.auth_header:
                 return True
             session = await self.get_session()
@@ -412,8 +502,11 @@ class OCEANVEIL:
         url = f"https://oceanveil.net/api/v1/anime_titles/{id}?include%5B%5D=anime_episodes"
         
         try:
+            req_headers = {}
+            if self.auth_header:
+                req_headers["authorization"] = self.auth_header
             res = await session.get(
-                url, headers={"authorization": self.auth_header}, cookies=self.cookies
+                url, headers=req_headers, cookies=self.cookies
             )
             if res.status_code != 200:
                 logger.error(f"Failed to fetch episodes: {res.status_code}")
@@ -529,7 +622,10 @@ async def download_file(semaphore, ep_data, auth, cookies, ua, save_dir, task_id
         cmd = [
             binary, url,
             "-H", f"Cookie: {cookies_str}",
-            "-H", f"Authorization: {auth}",
+        ]
+        if auth:
+            cmd += ["-H", f"Authorization: {auth}"]
+        cmd += [
             "-H", f"User-Agent: {ua}",
             "-H", f"Referer: {referer}",
             "--auto-select", "--save-dir", save_dir, "--save-name", temp_filename, "--no-log"
@@ -571,7 +667,22 @@ async def download_file(semaphore, ep_data, auth, cookies, ua, save_dir, task_id
         if proc.returncode == 0:
             return final_path
         else:
-            logger.error(f"[ERROR] Download failed for {ep_data['name']}")
+            # Capture stderr/stdout from the downloader so we know WHY it failed
+            # instead of just logging a generic "Download failed" message.
+            try:
+                stdout_data, stderr_data = await proc.communicate()
+            except Exception:
+                stdout_data, stderr_data = b"", b""
+            stderr_text = (stderr_data or b"").decode("utf-8", errors="replace").strip()
+            stdout_text = (stdout_data or b"").decode("utf-8", errors="replace").strip()
+            tail = stderr_text or stdout_text or "(no output)"
+            # Keep the log line readable; cap to last 800 chars.
+            if len(tail) > 800:
+                tail = "..." + tail[-800:]
+            logger.error(
+                f"[ERROR] Download failed for {ep_data['name']} "
+                f"(exit={proc.returncode}): {tail}"
+            )
             return None
 
 def mux_dual_audio(audio_file, video_file, output_path, audio_lang, video_lang, video_has_primary_audio=False):
@@ -660,7 +771,10 @@ async def start_cmd(client, message):
         "/engvdiddual <id1> <id2> [ep] - Dual Audio (Dub Video)\n"
         "/queue - Show all tasks\n"
         "/cancel <id> - Cancel a task\n"
-        "/logs [N] - Show last N log lines (owner only)"
+        "/logs [N] - Show last N log lines (owner only)\n"
+        "/setcookies - Load cookies.txt as OceanVeil session (owner only, DM)\n"
+        "/clearcookies - Drop cookie override (owner only, DM)\n"
+        "/cookiesinfo - Show active cookie override (owner only, DM)"
     )
 
 @app.on_message(filters.command(["queue", "status"]))
@@ -736,6 +850,128 @@ async def logs_cmd(client, message: Message):
                     os.remove(snapshot_path)
                 except Exception:
                     pass
+
+
+def _parse_netscape_cookies(content: str) -> dict:
+    """Parse Netscape-format cookies.txt content into a name->value dict.
+
+    Format per line: domain<TAB>flag<TAB>path<TAB>secure<TAB>expires<TAB>name<TAB>value
+    Lines starting with '#' are ignored, except for '#HttpOnly_' prefix
+    which is stripped (some browsers add it).
+    """
+    cookies: dict = {}
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            # Some exporters use whitespace instead of tabs.
+            parts = line.split()
+            if len(parts) < 7:
+                continue
+        name = parts[5]
+        value = parts[6] if len(parts) == 7 else "\t".join(parts[6:])
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+@app.on_message(filters.command(["setcookies", "setcookie"]) & filters.private)
+async def setcookies_cmd(client, message: Message):
+    """Owner-only. Load a Netscape-format cookies.txt as the OceanVeil session.
+
+    Send the cookies.txt file with /setcookies as the caption, OR reply to
+    a previously-sent cookies.txt with /setcookies.
+    Optional: append a Bearer/JWT auth header after the command, e.g.
+        /setcookies Bearer eyJhbGciOi...
+    """
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.reply_text("Not authorized.")
+        return
+
+    target = message if message.document else message.reply_to_message
+    if not target or not target.document:
+        await message.reply_text(
+            "Attach a cookies.txt (Netscape format) with /setcookies as the "
+            "caption, or reply to one with /setcookies."
+        )
+        return
+
+    doc = target.document
+    if doc.file_size and doc.file_size > 512 * 1024:
+        await message.reply_text("File too large (max 512 KB).")
+        return
+
+    tmp_path = await client.download_media(
+        target, file_name=f"cookies_{int(time.time())}.txt"
+    )
+    try:
+        with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+    cookies = _parse_netscape_cookies(content)
+    if not cookies:
+        await message.reply_text(
+            "Couldn't parse any cookies. Use Netscape cookies.txt format "
+            "(e.g. from the 'Get cookies.txt LOCALLY' browser extension)."
+        )
+        return
+
+    # Optional auth header passed inline: /setcookies Bearer xxx...
+    auth_header = None
+    if len(message.command) >= 2:
+        auth_header = " ".join(message.command[1:]).strip() or None
+
+    await ocean.set_cookie_override(cookies, auth_header=auth_header)
+
+    sample = ", ".join(list(cookies.keys())[:5])
+    more = "" if len(cookies) <= 5 else f" (+{len(cookies) - 5} more)"
+    await message.reply_text(
+        f"Loaded {len(cookies)} cookies. OceanVeil is now using the override.\n"
+        f"Keys: {sample}{more}\n"
+        f"Auth header: {'yes' if auth_header else 'no'}"
+    )
+
+
+@app.on_message(filters.command(["clearcookies", "clearcookie"]) & filters.private)
+async def clearcookies_cmd(client, message: Message):
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.reply_text("Not authorized.")
+        return
+    await ocean.clear_cookie_override()
+    await message.reply_text(
+        "Cookie override cleared. Falling back to email/password login."
+    )
+
+
+@app.on_message(filters.command(["cookiesinfo", "cookieinfo"]) & filters.private)
+async def cookiesinfo_cmd(client, message: Message):
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.reply_text("Not authorized.")
+        return
+    if not ocean.cookie_override:
+        await message.reply_text("No cookie override active.")
+        return
+    keys = list(ocean.cookie_override.keys())
+    preview = ", ".join(keys[:10])
+    more = "" if len(keys) <= 10 else f" (+{len(keys) - 10} more)"
+    await message.reply_text(
+        f"Cookie override active.\n"
+        f"Count: {len(keys)}\n"
+        f"Auth header: {'yes' if ocean.auth_header_override else 'no'}\n"
+        f"Keys: {preview}{more}"
+    )
 
 
 async def _error_dm_drainer():
