@@ -22,20 +22,28 @@ RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.5.1-beta/N_
     && chmod +x /usr/local/bin/N_m3u8DL-RE \
     && rm -rf N_m3u8DL-RE_v0.5.1-beta_linux-x64_20251029.tar.gz
 
-# Optional but recommended: non-root user
-RUN useradd -m appuser
+# Non-root user
+RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-# Install Python deps
+# Install Python deps (as root, so site-packages stays root-owned)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY . .
+# Copy app code with correct ownership so appuser can write
+# session files, downloads, and temp_work in this directory.
+COPY --chown=appuser:appuser . .
+
+# Pre-create writable dirs the bot uses at runtime
+RUN mkdir -p /app/downloads /app/temp_work /app/sessions \
+    && chown -R appuser:appuser /app
 
 # Drop privileges
 USER appuser
+
+# Tell the bot where to keep the Pyrogram session file
+ENV SESSION_DIR=/app/sessions
 
 # Start your bot
 CMD ["python", "bot.py"]

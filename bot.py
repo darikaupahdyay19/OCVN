@@ -581,11 +581,16 @@ def mux_dual_audio(audio_file, video_file, output_path, audio_lang, video_lang, 
 
 # --- Bot Logic ---
 
+# Session directory must be writable by the runtime user (see Dockerfile).
+SESSION_DIR = os.environ.get("SESSION_DIR", ".")
+os.makedirs(SESSION_DIR, exist_ok=True)
+
 app = Client(
-    "ocean_bot", 
-    api_id=int(API_ID), 
-    api_hash=API_HASH, 
+    "ocean_bot",
+    api_id=int(API_ID),
+    api_hash=API_HASH,
     bot_token=BOT_TOKEN,
+    workdir=SESSION_DIR,
     ipv6=False
 )
 Client.UPLOAD_CHUNK_SIZE = 1024 * 1024 * 4
@@ -808,7 +813,10 @@ async def dl_cmd(client, message: Message):
             shutil.rmtree(temp_dir, ignore_errors=True)
         # Final update to remove task from UI
         await progress_tracker.update_ui()
-        await status.delete() # Remove status message when done
+        try:
+            await status.delete()  # Remove status message when done
+        except Exception:
+            pass
 
 @app.on_message(filters.command(["dual", "engvdiddual"]))
 async def dual_cmd(client, message: Message):
@@ -999,18 +1007,20 @@ async def dual_cmd(client, message: Message):
         if os.path.exists(task_root):
             shutil.rmtree(task_root, ignore_errors=True)
         await progress_tracker.update_ui()
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     async def main():
         global ocean, sem
         ocean = OCEANVEIL()
         sem = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-        
+
         print("Starting Bot...")
-        await app.start()
-        print("Bot running. Press Ctrl+C to stop.")
-        await idle()
-        await app.stop()
+        async with app:
+            print("Bot running. Press Ctrl+C to stop.")
+            await idle()
 
     app.run(main())
