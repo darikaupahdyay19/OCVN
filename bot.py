@@ -578,9 +578,14 @@ class OCEANVEIL:
         """Search OceanVeil anime titles by name.
 
         Returns a list of dicts: [{id, name, lang_code, lang_name, is_nsfw}, ...]
-        Tries the typical JSON:API filter shapes; falls back gracefully if
-        one shape isn't supported by the backend. Authenticated users see
-        both SFW and NSFW results — we expose whichever the server returns.
+
+        OceanVeil's real search endpoint is
+            /api/v1/anime_titles/search?q=<term>&is_mature=<true|false>
+        and the `is_mature` flag SEGREGATES the index — NSFW titles are only
+        returned when `is_mature=true`. To surface both SFW and NSFW hits in
+        one /search response we hit the endpoint twice (mature=true and
+        mature=false) and merge by id. We also fall back to the older JSON:API
+        filter shapes in case the backend changes.
         """
         if not self.auth_header:
             if not await self.login():
@@ -593,42 +598,51 @@ class OCEANVEIL:
 
         from urllib.parse import quote_plus
         q = quote_plus(query.strip())
-        # Try the common JSON:API filter shapes used by ember/spree-style
-        # backends. The first one that yields non-empty data wins.
-        url_candidates = [
-            f"https://oceanveil.net/api/v1/anime_titles?filter%5Bname%5D={q}&page%5Blimit%5D={limit}",
-            f"https://oceanveil.net/api/v1/anime_titles?filter%5Btext%5D={q}&page%5Blimit%5D={limit}",
-            f"https://oceanveil.net/api/v1/anime_titles?q={q}&page%5Blimit%5D={limit}",
-        ]
+        ql = query.strip().lower()
 
-        for url in url_candidates:
+        # Per-call limit. Ask for `limit` rows from each (mature/non-mature)
+        # bucket so the merge can still surface up to `limit` total.
+        per_call = max(limit, 15)
+
+        merged: dict = {}
+
+        async def _fetch(url: str, force_nsfw: bool | None = None):
             try:
                 res = await session.get(url, headers=req_headers, cookies=self.cookies)
             except Exception as e:
                 logger.debug(f"search GET failed for {url}: {e}")
-                continue
+                return
             if res.status_code != 200:
                 logger.debug(f"search non-200 ({res.status_code}) for {url}")
-                continue
+                return
             try:
                 payload = res.json()
             except Exception:
-                continue
+                return
             items = payload.get("data") or []
-            if not items:
-                continue
-
-            results = []
-            ql = query.strip().lower()
             for item in items:
                 if not isinstance(item, dict):
                     continue
                 attrs = item.get("attributes") or {}
                 name = attrs.get("name") or ""
-                # Trim to top `limit` AFTER ranking by simple substring match
-                # so the most relevant rows show first.
-                results.append({
-                    "id": str(item.get("id", "")),
+                rid = str(item.get("id", ""))
+                if not rid:
+                    continue
+                api_nsfw = bool(
+                    attrs.get("nsfw")
+                    or attrs.get("isNsfw")
+                    or attrs.get("isAdult")
+                    or attrs.get("isMature")
+                    or attrs.get("is_mature")
+                    or attrs.get("ageRating") in ("R18", "NSFW", "Adult")
+                )
+                # If the API doesn't tag NSFW directly, trust the bucket
+                # the result came from (is_mature=true => NSFW).
+                is_nsfw = api_nsfw if api_nsfw or force_nsfw is None else bool(force_nsfw)
+                if force_nsfw is True:
+                    is_nsfw = True
+                merged[rid] = {
+                    "id": rid,
                     "name": name,
                     "name_clean": clean_filename(name),
                     "raw_name": name,
@@ -636,20 +650,48 @@ class OCEANVEIL:
                         re.search(r"\[\s*dub", name.lower())
                         or re.search(r"\bdub\b", name.lower())
                     ) else "jpn",
-                    "is_nsfw": bool(
-                        attrs.get("nsfw")
-                        or attrs.get("isNsfw")
-                        or attrs.get("isAdult")
-                        or attrs.get("ageRating") in ("R18", "NSFW", "Adult")
-                    ),
-                })
-            results.sort(
-                key=lambda r: (0 if ql in r["name"].lower() else 1, r["name"].lower())
-            )
-            results = results[:limit]
-            if results:
-                return results
-        return []
+                    "is_nsfw": is_nsfw,
+                }
+
+        # 1) Primary endpoint: /anime_titles/search?q=...&is_mature=...
+        #    Hit both mature buckets so NSFW + SFW are both represented.
+        primary_urls = [
+            (
+                f"https://oceanveil.net/api/v1/anime_titles/search?q={q}"
+                f"&include%5B%5D=genre&is_mature=true&page%5Blimit%5D={per_call}",
+                True,
+            ),
+            (
+                f"https://oceanveil.net/api/v1/anime_titles/search?q={q}"
+                f"&include%5B%5D=genre&is_mature=false&page%5Blimit%5D={per_call}",
+                False,
+            ),
+        ]
+        for url, force_nsfw in primary_urls:
+            await _fetch(url, force_nsfw=force_nsfw)
+
+        # 2) Fallbacks: if the primary endpoint returned nothing at all
+        #    (schema change, etc), try the older JSON:API filter shapes.
+        if not merged:
+            fallback_urls = [
+                f"https://oceanveil.net/api/v1/anime_titles?filter%5Bname%5D={q}&page%5Blimit%5D={per_call}",
+                f"https://oceanveil.net/api/v1/anime_titles?filter%5Btext%5D={q}&page%5Blimit%5D={per_call}",
+                f"https://oceanveil.net/api/v1/anime_titles?q={q}&page%5Blimit%5D={per_call}",
+            ]
+            for url in fallback_urls:
+                await _fetch(url, force_nsfw=None)
+                if merged:
+                    break
+
+        if not merged:
+            return []
+
+        results = list(merged.values())
+        # Rank: exact-substring matches first, then alphabetical.
+        results.sort(
+            key=lambda r: (0 if ql in r["name"].lower() else 1, r["name"].lower())
+        )
+        return results[:limit]
 
 async def setup_tool():
     tool_path = get_tool_path()
