@@ -26,10 +26,60 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# --- Log capture & error reporting setup ---
+from collections import deque
+
+LOG_FILE = "bot.log"
+_log_fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+# 1) Persistent log file
+try:
+    _file_handler = logging.FileHandler(LOG_FILE)
+    _file_handler.setFormatter(_log_fmt)
+    logging.getLogger().addHandler(_file_handler)
+except Exception as _e:
+    logger.warning(f"Could not attach file log handler: {_e}")
+
+# 2) In-memory ring buffer for /logs command
+log_buffer = deque(maxlen=500)
+
+class _MemoryLogHandler(logging.Handler):
+    def emit(self, record):
+        try:
+            log_buffer.append(self.format(record))
+        except Exception:
+            pass
+
+_mem_handler = _MemoryLogHandler()
+_mem_handler.setFormatter(_log_fmt)
+logging.getLogger().addHandler(_mem_handler)
+
+# 3) Telegram error notifier (queued, drained by background task)
+_pending_errors = deque(maxlen=50)
+
+class _TelegramErrorHandler(logging.Handler):
+    """Queues ERROR+ log records to be DM'd to OWNER_ID."""
+    def emit(self, record):
+        if record.levelno < logging.ERROR:
+            return
+        try:
+            _pending_errors.append(self.format(record))
+        except Exception:
+            pass
+
+_tg_err_handler = _TelegramErrorHandler()
+_tg_err_handler.setFormatter(_log_fmt)
+logging.getLogger().addHandler(_tg_err_handler)
+
 # Telegram Vars
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# Optional: Telegram user ID that receives error DMs and can use /logs
+_owner_raw = os.environ.get("OWNER_ID", "").strip()
+OWNER_ID = int(_owner_raw) if _owner_raw.isdigit() else None
+if OWNER_ID is None:
+    logger.warning("OWNER_ID not set: error DMs and /logs are disabled.")
 
 # OceanVeil Vars
 OV_EMAIL = os.environ.get("OV_EMAIL")
@@ -609,7 +659,8 @@ async def start_cmd(client, message):
         "/dual <id1> <id2> [ep] - Dual Audio (Sub Video)\n"
         "/engvdiddual <id1> <id2> [ep] - Dual Audio (Dub Video)\n"
         "/queue - Show all tasks\n"
-        "/cancel <id> - Cancel a task"
+        "/cancel <id> - Cancel a task\n"
+        "/logs [N] - Show last N log lines (owner only)"
     )
 
 @app.on_message(filters.command(["queue", "status"]))
@@ -644,6 +695,75 @@ async def cancel_cmd(client, message: Message):
             await message.reply_text("❌ Cannot cancel this task.")
     else:
         await message.reply_text(f"❌ Task ID `{target_id}` not found.")
+
+@app.on_message(filters.command(["logs", "log"]))
+async def logs_cmd(client, message: Message):
+    """Owner-only. Usage: /logs [N]  (default 50, max 500)."""
+    if OWNER_ID is None or message.from_user.id != OWNER_ID:
+        await message.reply_text("Not authorized.")
+        return
+
+    args = message.command
+    n = 50
+    if len(args) >= 2:
+        try:
+            n = max(1, min(int(args[1]), 500))
+        except ValueError:
+            await message.reply_text("Usage: /logs [N]  (1-500)")
+            return
+
+    lines = list(log_buffer)[-n:]
+    if not lines:
+        await message.reply_text("No log entries in buffer yet.")
+        return
+
+    text = "\n".join(lines)
+    # Telegram message limit is 4096 chars; send as file if larger.
+    if len(text) <= 3800:
+        await message.reply_text(f"```\n{text}\n```")
+    else:
+        snapshot_path = f"logs_{int(time.time())}.txt"
+        try:
+            with open(snapshot_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            await message.reply_document(
+                document=snapshot_path,
+                caption=f"Last {len(lines)} log lines",
+            )
+        finally:
+            if os.path.exists(snapshot_path):
+                try:
+                    os.remove(snapshot_path)
+                except Exception:
+                    pass
+
+
+async def _error_dm_drainer():
+    """Background task: forward queued ERROR logs to OWNER_ID."""
+    if OWNER_ID is None:
+        return
+    while True:
+        try:
+            if _pending_errors:
+                msg = _pending_errors.popleft()
+                # Trim to Telegram-safe size and wrap in code block.
+                snippet = msg if len(msg) <= 3500 else msg[:3500] + "\n...[truncated]"
+                try:
+                    await app.send_message(
+                        OWNER_ID,
+                        f"⚠️ Bot error:\n```\n{snippet}\n```",
+                    )
+                except Exception as e:
+                    # Avoid an error->DM->error loop: only debug-log this.
+                    logging.getLogger(__name__).debug(
+                        f"Failed to deliver error DM: {e}"
+                    )
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(2)
+
 
 @app.on_message(filters.command(["dl", "engdl"]))
 async def dl_cmd(client, message: Message):
@@ -1021,6 +1141,10 @@ if __name__ == "__main__":
         print("Starting Bot...")
         async with app:
             print("Bot running. Press Ctrl+C to stop.")
-            await idle()
+            drainer = asyncio.create_task(_error_dm_drainer())
+            try:
+                await idle()
+            finally:
+                drainer.cancel()
 
     app.run(main())
